@@ -39,6 +39,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { ScrollView } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
@@ -217,50 +218,83 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 	out.push(style.fg("dim", hr));
 
 	if (state.status === "auditing") {
-		// Auditor UI — shows a task-by-task verification overview so the
-		// user can see exactly what the auditor checked and what passed or failed.
-		out.push(style.fg("dim", `  ${style.fg("muted", "Verifying:")} checking each task against its criteria`));
+		// Left/right split: left column = task list, right column = auditor token stream.
+		// The user sees both at once: what is being checked and what the auditor is saying.
+		const leftW = Math.max(20, Math.floor(innerWidth * 0.38));
+		const rightW = Math.max(20, innerWidth - leftW - 3); // 3 for separator " │ "
+		const sep = style.fg("dim", "│");
 
-		// Show each task with its audit verdict
+		// ── Left column: task list (plain strings, styled at merge time) ──
+		const leftPlain: string[] = [];
+		leftPlain.push("Tasks");
 		for (const task of state.tasks) {
 			let icon: string;
 			let note: string;
 			if (!task.auditResult) {
-				icon = style.fg("muted", "○");
-				note = style.fg("muted", "checking...");
+				icon = "○";
+				note = "···";
 			} else if (task.status === "completed") {
-				icon = style.fg("success", "✓");
-				note = style.fg("success", "passed");
+				icon = "✓";
+				note = "ok";
 			} else {
-				icon = style.fg("error", "✗");
-				const r = task.auditResult;
-				note = r.length > innerWidth - 28 ? r.slice(0, innerWidth - 29) + "…" : style.fg("error", r);
+				icon = "✗";
+				note = "FAIL";
 			}
-			const maxDesc = innerWidth - 14;
+			const maxDesc = leftW - 12;
 			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "…" : task.description;
-			out.push(`  ${icon} ${style.fg("text", desc)}  ${note}`);
+			leftPlain.push(` ${icon} ${desc.padEnd(maxDesc, " ")} ${note}`);
 		}
 
-		// Audit log entries (recent activity from the isolated auditor)
+		// ── Right column: auditor token stream (plain strings, styled at merge) ──
+		const rightPlain: string[] = [];
+		rightPlain.push("Auditor");
 		const log = state.auditLog || [];
+
 		if (log.length > 0) {
-			const maxLog = Math.min(2, log.length);
-			const start = Math.max(0, log.length - maxLog);
+			const maxLines = Math.max(state.tasks.length + 1, 6);
+			const start = Math.max(0, log.length - maxLines);
 			for (let i = start; i < log.length; i++) {
-				const trimmed = log[i].length > innerWidth - 4 ? log[i].slice(0, innerWidth - 5) + "…" : log[i];
-				out.push(`  ${style.fg("dim", trimmed)}`);
+				const trimmed = log[i].length > rightW - 4 ? log[i].slice(0, rightW - 7) + "…" : log[i];
+				rightPlain.push(trimmed);
+			}
+		} else {
+			const pending = !state.auditFeedback || state.auditFeedback === "auditor pending...";
+			if (pending) {
+				rightPlain.push("auditor pending...");
+				rightPlain.push("waiting for host to spawn");
+			} else {
+				rightPlain.push(state.auditFeedback!);
 			}
 		}
 
-		// Verdict line: pending or final verdict
-		const pending = !state.auditFeedback || state.auditFeedback === "auditor pending...";
-		if (pending && log.length === 0) {
-			out.push(`  ${style.fg("muted", "auditor pending...")}`);
-		} else if (state.auditFeedback && state.auditFeedback !== "auditor pending...") {
-			const trimmed = state.auditFeedback.length > innerWidth - 12
-				? state.auditFeedback.slice(0, innerWidth - 13) + "…"
+		// ── Merge columns with visible-width padding ──
+		const maxRows = Math.max(leftPlain.length, rightPlain.length);
+		// Left header + task rows get fg("text") styling; right header is dim, rest are text.
+		for (let i = 0; i < maxRows; i++) {
+			const lRaw = i < leftPlain.length ? leftPlain[i] : "";
+			const lVis = visibleWidth(lRaw);
+			const lPad = lVis < leftW ? " ".repeat(leftW - lVis) : "";
+			const lFinal =
+				i === 0
+					? style.fg("muted", lRaw + lPad)
+					: lRaw.trimStart().startsWith("✓")
+						? style.fg("text", " " + style.fg("success", "✓") + lRaw.slice(2) + lPad)
+						: lRaw.trimStart().startsWith("✗")
+							? style.fg("text", " " + style.fg("error", "✗") + lRaw.slice(2) + lPad)
+							: style.fg("text", lRaw + lPad);
+
+			const rRaw = i < rightPlain.length ? rightPlain[i] : "";
+			const rFinal = i === 0 ? style.fg("dim", ` ${rRaw}`) : rRaw ? ` ${style.fg("text", rRaw)}` : "";
+
+			out.push(` ${lFinal} ${sep}${rFinal}`);
+		}
+
+		// Verdict footer when audit is done
+		if (state.auditFeedback && state.auditFeedback !== "auditor pending..." && log.length > 0) {
+			const trimmed = state.auditFeedback.length > innerWidth - 4
+				? state.auditFeedback.slice(0, innerWidth - 5) + "…"
 				: state.auditFeedback;
-			out.push(`  ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
+			out.push(` ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
 		}
 
 		out.push(style.fg("dim", hr));
