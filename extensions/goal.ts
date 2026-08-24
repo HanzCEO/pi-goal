@@ -154,42 +154,13 @@ function buildTaskWindow(tasks: TaskState[], currentIndex: number, availWidth: n
 	}
 	return lines.join("\n");
 }
-
 // ---------------------------------------------------------------------------
-// Colored widget component (above the editor)
+// Widget rendering
+// The live widget is built by refreshWidget (Container + cached Text[]), which
+// calls renderWidgetLines below. (An earlier GoalWidget class was dead code.)
 // ---------------------------------------------------------------------------
-
-class GoalWidget extends Container {
-	private state: GoalState;
-
-	constructor(state: GoalState) {
-		super();
-		this.state = state;
-		this.rebuild();
-	}
-
-	update(state: GoalState): void {
-		this.state = state;
-		this.clear();
-		this.rebuild();
-		this.invalidate();
-	}
-
-	private rebuild(): void {
-		// Theme is resolved via the host at construction time. We use a
-		// small helper that reads the current theme from the global
-		// `ctx.ui.theme`. To keep this class simple, accept the theme at
-		// rebuild time. (The host refreshes the widget after each
-		// state mutation and re-renders with the current theme.)
-	}
-
-	override render(width: number): string[] {
-		const lines = renderWidgetLines(this.state, width);
-		return lines;
-	}
-}
-
 // Render the widget as plain styled strings (theme + colors applied).
+
 function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | undefined): string[] {
 	const style = theme
 		? makeStyleHelpers(theme)
@@ -223,8 +194,8 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 	if (state.status === "auditing") {
 		// Left/right split: left column = task list, right column = auditor token stream.
 		// The user sees both at once: what is being checked and what the auditor is saying.
-		const leftW = Math.max(20, Math.floor(innerWidth * 0.38));
-		const rightW = Math.max(20, innerWidth - leftW - 3); // 3 for separator " │ "
+		const leftW = Math.max(1, Math.min(Math.max(20, Math.floor(innerWidth * 0.38)), innerWidth - 4));
+		const rightW = Math.max(1, innerWidth - leftW - 3);
 		const sep = style.fg("dim", "│");
 
 		// ── Left column: task list (plain strings, styled at merge time) ──
@@ -234,8 +205,8 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			let icon: string;
 			let note: string;
 			if (!task.auditResult) {
-				icon = "○";
-				note = "···";
+				icon = "◐";
+				note = "verifying…";
 			} else if (task.status === "completed") {
 				icon = "✓";
 				note = "ok";
@@ -336,14 +307,25 @@ interface ThemeLike {
 }
 
 function makeStyleHelpers(theme: ThemeLike) {
-	// Do NOT spread the theme object here. Theme methods may live on a
-	// prototype (class instance), so a spread would drop `fg`/`bold`/`italic`.
-	// Instead close over the real object and forward every call to it.
+	// Canonical color names used by renderWidgetLines. A host theme is
+	// expected to understand these; if it does not (or its fg throws),
+	// we fall back to plain text rather than crashing the widget.
+	const WIDGET_COLORS = ["accent", "border", "warning", "muted", "dim", "text", "success", "error"];
+
+	const fg = (c: string, s: string): string => {
+		if (!WIDGET_COLORS.includes(c)) return s;
+		try {
+			return theme.fg(c, s);
+		} catch {
+			return s;
+		}
+	};
+
 	return {
-		fg: (c: string, s: string) => theme.fg(c, s),
+		fg,
 		bold: (s: string) => theme.bold(s),
 		italic: (s: string) => theme.italic(s),
-		muted: (s: string) => theme.fg("muted", s),
+		muted: (s: string) => fg("muted", s),
 	};
 }
 
@@ -447,11 +429,18 @@ let activeWatcher: fs.FSWatcher | null = null;
 // only repaints changed cells instead of rebuilding the component tree.
 let widgetCache: { container: Container; texts: Text[] } | null = null;
 
+// Clear the live widget and drop the cached Container/Text so a future
+// refresh rebuilds from fresh state. Centralized so every clear path
+// (audit completion, rejection, fail, stop, delete, clear) stays consistent.
+function clearWidget(ctx: ExtensionContext): void {
+	ctx.ui.setWidget("pi-goal", undefined);
+	widgetCache = null;
+}
+
 function refreshWidget(ctx: ExtensionContext): void {
 	const state = loadState();
 	if (!state || state.status === "completed" || state.status === "failed" || state.status === "stopped") {
-		ctx.ui.setWidget("pi-goal", undefined);
-		widgetCache = null;
+		clearWidget(ctx);
 		return;
 	}
 	ctx.ui.setWidget("pi-goal", (tui, theme) => {
@@ -495,7 +484,7 @@ function startWatcher(ctx: ExtensionContext): void {
 	ensureStateDir();
 	try {
 		activeWatcher = fs.watch(dir, (eventType, filename) => {
-			if (filename === "state.json") {
+			if (filename && filename.endsWith("state.json")) {
 				setTimeout(() => {
 					if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
 				}, 50);
@@ -832,7 +821,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 				const failedList = failed
 					.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
 					.join("\n");
-				const msg = [
+				const msg: Array<{ type: "text"; text: string }> = [
 					{
 						type: "text",
 						text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${st.auditFeedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
@@ -845,7 +834,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 					api.sendUserMessage(msg, { deliverAs: "followUp" });
 				}
 			} else if (st && st.status === "completed") {
-				ctx.ui.setWidget("pi-goal", undefined);
+				clearWidget(ctx);
 				ctx.ui.setStatus("pi-goal", "");
 				ctx.ui.notify(`Goal audited and completed.\n\n${st.auditFeedback}`, "info");
 			}
@@ -1216,7 +1205,7 @@ export default function (pi: ExtensionAPI) {
 			const result = applyAuditVerdict(params);
 
 			if (result.approved) {
-				ctx.ui.setWidget("pi-goal", undefined);
+				clearWidget(ctx);
 				ctx.ui.setStatus("pi-goal", "");
 				ctx.ui.notify(`Goal audited and completed.\n\n${params.feedback}`, "info");
 				return {
@@ -1268,7 +1257,7 @@ export default function (pi: ExtensionAPI) {
 				saveState(state);
 			}
 			stopWatcher();
-			ctx.ui.setWidget("pi-goal", undefined);
+			clearWidget(ctx);
 			ctx.ui.setStatus("pi-goal", "");
 			ctx.ui.notify(`Goal failed: ${params.reason}`, "error");
 			return {
@@ -1445,7 +1434,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 			state.result = "Stopped by user";
 			saveState(state);
 			stopWatcher();
-			ctx.ui.setWidget("pi-goal", undefined);
+			clearWidget(ctx);
 			ctx.ui.setStatus("pi-goal", "");
 			ctx.ui.notify("Goal stopped.", "info");
 		},
@@ -1461,7 +1450,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 			}
 			clearState();
 			stopWatcher();
-			ctx.ui.setWidget("pi-goal", undefined);
+			clearWidget(ctx);
 			ctx.ui.setStatus("pi-goal", "");
 			ctx.ui.notify("Goal deleted.", "info");
 		},
@@ -1477,7 +1466,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 			}
 			clearState();
 			stopWatcher();
-			ctx.ui.setWidget("pi-goal", undefined);
+			clearWidget(ctx);
 			ctx.ui.setStatus("pi-goal", "");
 			ctx.ui.notify("Goal state cleared.", "info");
 		},
