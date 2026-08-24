@@ -832,12 +832,18 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 				const failedList = failed
 					.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
 					.join("\n");
-				api.sendUserMessage([
+				const msg = [
 					{
 						type: "text",
 						text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${st.auditFeedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
 					},
-				]);
+				];
+				if (ctx.isIdle()) {
+					api.sendUserMessage(msg);
+				} else {
+					// Agent is still finishing its turn; queue until it settles.
+					api.sendUserMessage(msg, { deliverAs: "followUp" });
+				}
 			} else if (st && st.status === "completed") {
 				ctx.ui.setWidget("pi-goal", undefined);
 				ctx.ui.setStatus("pi-goal", "");
