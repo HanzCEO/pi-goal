@@ -20,11 +20,13 @@
  *
  * Audit loop:
  *   `goal_complete` does not finalize the goal. It transitions the state
- *   to "auditing" and the system deterministically spawns an isolated
- *   auditor that verifies the work. The auditor calls goal_audit_result
- *   (AUDITOR-ONLY). The auditor either approves (transitioning to
- *   "completed") or rejects (returning tasks to "pending" so the host can
- *   re-execute and call goal_complete again).
+ *   to "auditing" and spawns an isolated auditor in-process via the pi SDK
+ *   (createAgentSession) with a fresh, bounded context. The auditor's
+ *   thinking tokens and tool calls are streamed live into the widget's
+ *   audit log so the user watches the audit happen. The auditor submits
+ *   its verdict through goal_audit_result (AUDITOR-ONLY), which either
+ *   approves (transitioning to "completed") or rejects (returning tasks
+ *   to "pending" so the host can re-execute and call goal_complete again).
  *
  * Built on the research from the pi-goal project:
  *   - Workers execute in fresh, bounded contexts
@@ -36,6 +38,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { ScrollView } from "@earendil-works/pi-tui";
@@ -514,6 +517,344 @@ function stopWatcher(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Audit runner — spawns the isolated auditor in-process and streams its
+// activity (thinking tokens, tool calls, results) into state.auditLog so the
+// widget panel updates live while the audit runs.
+// ---------------------------------------------------------------------------
+
+const AUDITOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+let auditInFlight: Promise<void> | null = null;
+let auditFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+// The verdict tool injected into the auditor session. It applies the verdict
+// by writing shared state, which the main session's widget watcher picks up.
+const auditVerdictTool = defineTool({
+	name: "goal_audit_result",
+	label: "Submit audit result",
+	description:
+		"AUDITOR-ONLY. Submit the verdict from an isolated auditor. If approved, the goal is completed. If rejected, the failed tasks are reset to pending so the host can re-execute. Only the auditor should call this tool.",
+	parameters: Type.Object({
+		approved: Type.Boolean({ description: "True if the auditor verified all tasks meet their acceptance criteria" }),
+		feedback: Type.String({ description: "The auditor's verdict and reasoning" }),
+		failedTasks: Type.Optional(
+			Type.Array(
+				Type.Object({
+					id: Type.String(),
+					reason: Type.String(),
+				}),
+				{ description: "Tasks that did not meet their acceptance criteria (only when approved=false)" },
+			),
+		),
+	}),
+	executionMode: "sequential",
+
+	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		const result = applyAuditVerdict(params);
+		return {
+			content: [
+				{
+					type: "text",
+					text: result.approved
+						? "Verdict recorded. Goal completed."
+						: `Verdict recorded. ${result.failedTaskCount} task(s) reset to pending.`,
+				},
+			],
+			details: { approved: result.approved, failedTaskCount: result.failedTaskCount },
+		};
+	},
+});
+
+function appendAuditLog(lines: string[]): void {
+	const state = loadState();
+	if (!state || state.status !== "auditing") return;
+	state.auditLog = [...(state.auditLog || []), ...lines];
+	saveState(state);
+}
+
+// Batch high-frequency thinking deltas (they arrive token by token) and
+// persist the growing thought line on a short timer, so the widget updates
+// live without writing the state file on every token.
+let pendingThinkingText: string | null = null;
+
+function scheduleAuditThinkingFlush(text: string): void {
+	pendingThinkingText = text;
+	if (auditFlushTimer) return;
+	auditFlushTimer = setTimeout(() => {
+		auditFlushTimer = null;
+		const text = pendingThinkingText;
+		pendingThinkingText = null;
+		if (text === null) return;
+		const st = loadState();
+		if (!st || st.status !== "auditing") return;
+		const tail = st.auditLog[st.auditLog.length - 1];
+		const line = "💭 " + text.trim();
+		if (tail && tail.startsWith("💭 ")) {
+			st.auditLog[st.auditLog.length - 1] = line;
+		} else {
+			st.auditLog = [...(st.auditLog || []), line];
+		}
+		saveState(st);
+		if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
+	}, 100);
+}
+
+function auditLogError(message: string): void {
+	const state = loadState();
+	if (!state || state.status !== "auditing") return;
+	state.auditLog = [...(state.auditLog || []), message];
+	state.auditFeedback = message.replace(/^[✓✗]\s*/, "");
+	saveState(state);
+}
+
+// Apply the auditor verdict to persisted state. Shared by the AUDITOR-ONLY
+// goal_audit_result tool (external caller) and the in-process audit session.
+function applyAuditVerdict(params: { approved: boolean; feedback: string; failedTasks?: { id: string; reason: string }[] }): {
+	approved: boolean;
+	failedTaskCount: number;
+} {
+	const state = loadState();
+	if (!state) {
+		return { approved: params.approved, failedTaskCount: 0 };
+	}
+
+	state.auditFeedback = params.feedback;
+
+	if (params.approved) {
+		state.status = "completed";
+		state.tasks = state.tasks.map((t) => ({
+			...t,
+			status: "completed" as const,
+			auditResult: params.feedback,
+		}));
+		state.auditLog = [...(state.auditLog || []), `✓ Approved: ${params.feedback}`];
+		saveState(state);
+		return { approved: true, failedTaskCount: 0 };
+	}
+
+	const failedIds = new Set((params.failedTasks || []).map((t) => t.id));
+	const failedReasons = new Map((params.failedTasks || []).map((t) => [t.id, t.reason] as const));
+	state.status = "active";
+	state.tasks = state.tasks.map((t) => {
+		if (failedIds.has(t.id)) {
+			return {
+				...t,
+				status: "pending" as const,
+				auditResult: failedReasons.get(t.id) || params.feedback,
+				error: failedReasons.get(t.id) || null,
+			};
+		}
+		return { ...t, status: "completed" as const, auditResult: params.feedback };
+	});
+	state.auditLog = [...(state.auditLog || []), `✗ Rejected: ${params.feedback}`];
+	for (const ft of params.failedTasks || []) {
+		state.auditLog.push(`  - ${ft.id}: ${ft.reason}`);
+	}
+	saveState(state);
+	return { approved: false, failedTaskCount: failedIds.size };
+}
+
+function summarizeArgs(toolName: string, args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	try {
+		if (toolName === "read" || toolName === "bash") {
+			const v = a.path ?? a.command;
+			if (typeof v === "string") return v.split(/\s+/).join(" ").slice(0, 80);
+		}
+		if (toolName === "write" || toolName === "edit") {
+			const v = a.path;
+			if (typeof v === "string") return v;
+		}
+		const first = Object.values(a).find((v) => typeof v === "string");
+		if (typeof first === "string") return first.slice(0, 80);
+	} catch {
+		// fall through
+	}
+	return "";
+}
+
+function summarizeResult(result: unknown): string {
+	if (result === null || result === undefined) return "";
+	try {
+		if (typeof result === "string") return result.replace(/\s+/g, " ").trim().slice(0, 100);
+		if (typeof result === "object") {
+			const text = (result as { text?: string }).text;
+			if (typeof text === "string") return text.replace(/\s+/g, " ").trim().slice(0, 100);
+		}
+	} catch {
+		// fall through
+	}
+	return "";
+}
+
+function buildAuditorSystemPrompt(state: GoalState): string {
+	const tasks = state.tasks
+		.map((t, i) => {
+			const criteria = t.acceptanceCriteria.map((c) => `      - ${c}`).join("\n");
+			return `  ${i + 1}. ${t.id}: ${t.description}\n     contract: ${t.contract}\n     acceptance criteria:\n${criteria}`;
+		})
+		.join("\n\n");
+	return `You are the goal auditor for an agentic workflow. Your job is to verify, with a fresh and critical eye, that the work delivered for a goal actually meets every acceptance criterion. You are an independent reviewer: trust nothing, verify everything yourself.
+
+You have read-only verification tools (read, bash, grep, find, ls) plus write/edit only when you must create test artifacts; you must NEVER modify the goal's state file (.pi/goal/state.json).
+
+## Goal
+${state.refinedGoal || state.goal}
+
+## Claimed work summary (from the executor)
+${state.result || "(none provided)"}
+
+## Tasks and acceptance criteria to verify
+${tasks}
+
+## Procedure
+1. Read the current state from .pi/goal/state.json to see what the executor claims.
+2. For each task, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
+3. Keep working until every criterion is either verified or disproven.
+
+## Verdict
+When you are done, call the tool goal_audit_result exactly once with:
+- approved: true if EVERY acceptance criterion of EVERY task is met, else false.
+- feedback: a concise verdict explaining what you verified and, on rejection, what failed.
+- failedTasks: only when approved=false, the list of { id, reason } for each task that did not meet its criteria. Omit the field when approved=true.
+
+Be strict but fair. A single unmet criterion means rejection.`;
+}
+
+function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
+	if (auditInFlight) return auditInFlight;
+
+	auditInFlight = (async () => {
+		const state = loadState();
+		if (!state || state.status !== "auditing") return;
+
+		appendAuditLog(["spawning isolated auditor..."]);
+
+		let modelRuntime;
+		try {
+			modelRuntime = await ModelRuntime.create();
+		} catch (err) {
+			auditLogError(`✗ could not initialize model runtime: ${(err as Error).message}`);
+			throw err;
+		}
+
+		// Fully isolated session: no project/user extensions (so the goal
+		// extension does not re-register its tools or widgets inside the
+		// auditor), no skills, no prompt templates, no context files. The
+		// auditor gets only the read/verify tools plus the verdict tool.
+		const loader = new DefaultResourceLoader({
+			cwd: ctx.cwd,
+			agentDir: getAgentDir(),
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		await loader.reload();
+
+		const { session } = await createAgentSession({
+			modelRuntime,
+			cwd: ctx.cwd,
+			resourceLoader: loader,
+			sessionManager: SessionManager.inMemory(),
+			model: ctx.model,
+			thinkingLevel: ctx.thinkingLevel ?? "medium",
+			tools: [...AUDITOR_TOOLS, "goal_audit_result"],
+			customTools: [auditVerdictTool],
+		});
+
+		// A fresh, bounded context: no goal tools other than the verdict
+		// submitter we inject here.
+		session.agent.state.systemPrompt = buildAuditorSystemPrompt(loadState() || state);
+
+		// Stream the auditor's activity into the audit log.
+		let thinkingBuf = "";
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "message_update") {
+				const ev = event.assistantMessageEvent;
+				if (ev.type === "thinking_delta") {
+					thinkingBuf += ev.delta;
+					// Persist the growing thought line on a debounce; the panel
+					// shows a live, growing thought instead of a new line per token.
+					scheduleAuditThinkingFlush(thinkingBuf);
+					return;
+				}
+				if (ev.type === "thinking_end") {
+					thinkingBuf = "";
+				}
+				return;
+			}
+
+			if (event.type === "tool_execution_start") {
+				const arg = summarizeArgs(event.toolName, event.args);
+				appendAuditLog([`▶ ${event.toolName}${arg ? ` ${arg}` : ""}`]);
+				return;
+			}
+
+			if (event.type === "tool_execution_end") {
+				const summary = summarizeResult(event.result);
+				const marker = event.isError ? "✗" : "✓";
+				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` → ${summary}` : ""}`]);
+				if (event.toolName === "goal_audit_result") {
+					// The verdict tool already applied the result via its own
+					// execute; stop here.
+					return;
+				}
+				return;
+			}
+
+			if (event.type === "agent_end") {
+				appendAuditLog(["auditor finished"]);
+			}
+		});
+
+		try {
+			await session.prompt(
+				"Audit the goal now. Read .pi/goal/state.json first, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
+			);
+
+			// Finalize once the audit run completes: if the verdict tool was
+			// never called (e.g. the auditor stopped early), surface that the
+			// goal is still pending and unstick the widget.
+			const st = loadState();
+			if (st && st.status === "auditing") {
+				const log = st.auditLog || [];
+				const hasVerdict = log.some((l) => l.startsWith("✓ Approved") || l.startsWith("✗ Rejected"));
+				if (!hasVerdict) {
+					st.auditLog = [...log, "⚠ auditor stopped without a verdict. Call goal_complete again to re-audit."];
+					saveState(st);
+				}
+			} else if (st && st.status === "active") {
+				// Rejected: hand the failing tasks back to the main agent.
+				const failed = st.tasks.filter((t) => t.status !== "completed");
+				const failedList = failed
+					.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
+					.join("\n");
+				api.sendUserMessage([
+					{
+						type: "text",
+						text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${st.auditFeedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
+					},
+				]);
+			} else if (st && st.status === "completed") {
+				ctx.ui.setWidget("pi-goal", undefined);
+				ctx.ui.setStatus("pi-goal", "");
+				ctx.ui.notify(`Goal audited and completed.\n\n${st.auditFeedback}`, "info");
+			}
+		} finally {
+			unsubscribe();
+			session.dispose();
+		}
+	})().finally(() => {
+		auditInFlight = null;
+	});
+
+	return auditInFlight;
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -772,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Complete goal",
 		description:
 			"Submit the goal for audit. Requires every task to be marked completed first. " +
-			"The system spawns an isolated auditor deterministically. Do not attempt to spawn the auditor yourself.",
+			"This spawns an isolated auditor in the background that streams its activity into the panel. Do not attempt to spawn the auditor yourself.",
 		parameters: Type.Object({
 			summary: Type.String({ description: "Summary of what was accomplished" }),
 		}),
@@ -811,11 +1152,25 @@ export default function (pi: ExtensionAPI) {
 			saveState(state);
 			refreshWidget(ctx as ExtensionContext);
 
+			// Spawn the isolated auditor in-process and stream its activity
+			// into the widget panel. Fire-and-forget: the tool returns
+			// immediately while the audit runs in the background.
+			runAudit(ctx as ExtensionContext, pi).catch((err) => {
+				const s = loadState();
+				if (s && s.status === "auditing") {
+					s.status = "active";
+					s.auditFeedback = `Audit failed: ${(err as Error).message}`;
+					s.auditLog = [...(s.auditLog || []), `✗ Audit failed: ${(err as Error).message}`];
+					saveState(s);
+					refreshWidget(ctx as ExtensionContext);
+				}
+			});
+
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Goal submitted for audit. The system will spawn an isolated auditor automatically. Wait for the audit result.`,
+						text: `Goal submitted for audit. The auditor is running in the background — its activity streams into the panel above. The verdict arrives via goal_audit_result.`,
 					},
 				],
 				details: { submittedForAudit: true, summary: params.summary },
@@ -827,7 +1182,7 @@ export default function (pi: ExtensionAPI) {
 		name: "goal_audit_result",
 		label: "Submit audit result",
 		description:
-			"AUDITOR-ONLY. Submit the verdict from an isolated auditor. If approved, the goal is completed. If rejected, the failed tasks are reset to pending so the host can re-execute. Only the externally spawned auditor should call this tool.",
+			"AUDITOR-ONLY. Submit the verdict from an isolated auditor. If approved, the goal is completed. If rejected, the failed tasks are reset to pending so the host can re-execute. Only the in-process auditor should call this tool.",
 		parameters: Type.Object({
 			approved: Type.Boolean({ description: "True if the auditor verified all tasks meet their acceptance criteria" }),
 			feedback: Type.String({ description: "The auditor's verdict and reasoning" }),
@@ -852,46 +1207,19 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			state.auditFeedback = params.feedback;
+			const result = applyAuditVerdict(params);
 
-			if (params.approved) {
-				state.status = "completed";
-				state.tasks = state.tasks.map((t) => ({
-					...t,
-					status: "completed" as const,
-					auditResult: params.feedback,
-				}));
-				state.auditLog = [...(state.auditLog || []), `✓ Approved: ${params.feedback}`];
-				saveState(state);
+			if (result.approved) {
 				ctx.ui.setWidget("pi-goal", undefined);
 				ctx.ui.setStatus("pi-goal", "");
-				ctx.ui.notify(`Goal audited and completed.\n\n${params.feedback}`, "success");
+				ctx.ui.notify(`Goal audited and completed.\n\n${params.feedback}`, "info");
 				return {
 					content: [{ type: "text", text: `Auditor approved. Goal completed.\n\n${params.feedback}` }],
 					details: { approved: true },
 				};
 			}
 
-			// Reject: reset failed tasks to pending so the host re-executes.
-			const failedIds = new Set((params.failedTasks || []).map((t) => t.id));
-			const failedReasons = new Map((params.failedTasks || []).map((t) => [t.id, t.reason] as const));
-			state.status = "active";
-			state.tasks = state.tasks.map((t) => {
-				if (failedIds.has(t.id)) {
-					return {
-						...t,
-						status: "pending" as const,
-						auditResult: failedReasons.get(t.id) || params.feedback,
-						error: failedReasons.get(t.id) || null,
-					};
-				}
-				return { ...t, status: "completed" as const, auditResult: params.feedback };
-			});
-			state.auditLog = [...(state.auditLog || []), `✗ Rejected: ${params.feedback}`];
-			for (const ft of params.failedTasks || []) {
-				state.auditLog.push(`  - ${ft.id}: ${ft.reason}`);
-			}
-			saveState(state);
+			// Rejected: tell the main agent to re-execute the failing tasks.
 			refreshWidget(ctx as ExtensionContext);
 
 			const failedList = (params.failedTasks || [])
@@ -899,27 +1227,20 @@ export default function (pi: ExtensionAPI) {
 				.join("\n");
 
 			pi.sendUserMessage([
-					{
-						type: "text",
-						text: `The auditor rejected the work. Tasks reset to pending.
-
-**Auditor feedback:** ${params.feedback}
-
-**Tasks that need rework:**
-${failedList}
-
-Re-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
-					},
-				]);
+				{
+					type: "text",
+					text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${params.feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
+				},
+			]);
 
 			return {
 				content: [
 					{
-					type: "text",
-					text: `Auditor rejected. ${failedIds.size} task(s) reset to pending. Re-execute and re-submit.`,
+						type: "text",
+						text: `Auditor rejected. ${result.failedTaskCount} task(s) reset to pending. Re-execute and re-submit.`,
 					},
 				],
-				details: { approved: false, failedTaskCount: failedIds.size },
+				details: { approved: false, failedTaskCount: result.failedTaskCount },
 			};
 		},
 	});
@@ -1003,9 +1324,9 @@ Work through it step by step:
 
 5. **Mark done** — After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate — mark it done right after verification.
 
-6. **Complete** — When all tasks are marked done, call goal_complete with a summary. The system will spawn an isolated auditor deterministically. Do NOT try to spawn the auditor yourself — it is handled externally.
+6. **Complete** — When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
 
-7. **Audit result** — goal_audit_result is AUDITOR-ONLY. You do not call it. The externally spawned auditor calls it directly. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
+7. **Audit result** — goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict; you do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
 
 The state file at .pi/goal/state.json is updated automatically. You can read it to track progress.`,
 				},
