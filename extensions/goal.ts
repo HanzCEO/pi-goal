@@ -38,6 +38,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { ScrollView } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
@@ -216,26 +217,50 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 	out.push(style.fg("dim", hr));
 
 	if (state.status === "auditing") {
-		// Auditor UI — replaces the task list entirely. Same height budget
-		// as the task list (8 lines) so the widget doesn't grow.
-		out.push(style.bold(style.fg("warning", "  ▶ AUDIT LOG")));
+		// Auditor UI — shows a task-by-task verification overview so the
+		// user can see exactly what the auditor checked and what passed or failed.
+		out.push(style.fg("dim", `  ${style.fg("muted", "Verifying:")} checking each task against its criteria`));
 
-		const log = state.auditLog || [];
-		const maxLog = 3;
-		const start = Math.max(0, log.length - maxLog);
-		for (let i = start; i < log.length; i++) {
-			const trimmed = log[i].length > innerWidth - 2 ? log[i].slice(0, innerWidth - 3) + "…" : log[i];
-			out.push(`  ${style.fg("text", trimmed)}`);
+		// Show each task with its audit verdict
+		for (const task of state.tasks) {
+			let icon: string;
+			let note: string;
+			if (!task.auditResult) {
+				icon = style.fg("muted", "○");
+				note = style.fg("muted", "checking...");
+			} else if (task.status === "completed") {
+				icon = style.fg("success", "✓");
+				note = style.fg("success", "passed");
+			} else {
+				icon = style.fg("error", "✗");
+				const r = task.auditResult;
+				note = r.length > innerWidth - 28 ? r.slice(0, innerWidth - 29) + "…" : style.fg("error", r);
+			}
+			const maxDesc = innerWidth - 14;
+			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "…" : task.description;
+			out.push(`  ${icon} ${style.fg("text", desc)}  ${note}`);
 		}
 
+		// Audit log entries (recent activity from the isolated auditor)
+		const log = state.auditLog || [];
+		if (log.length > 0) {
+			const maxLog = Math.min(2, log.length);
+			const start = Math.max(0, log.length - maxLog);
+			for (let i = start; i < log.length; i++) {
+				const trimmed = log[i].length > innerWidth - 4 ? log[i].slice(0, innerWidth - 5) + "…" : log[i];
+				out.push(`  ${style.fg("dim", trimmed)}`);
+			}
+		}
+
+		// Verdict line: pending or final verdict
 		const pending = !state.auditFeedback || state.auditFeedback === "auditor pending...";
 		if (pending && log.length === 0) {
 			out.push(`  ${style.fg("muted", "auditor pending...")}`);
-		} else if (state.auditFeedback) {
-			const trimmed = state.auditFeedback.length > innerWidth - 2
-				? state.auditFeedback.slice(0, innerWidth - 3) + "…"
+		} else if (state.auditFeedback && state.auditFeedback !== "auditor pending...") {
+			const trimmed = state.auditFeedback.length > innerWidth - 12
+				? state.auditFeedback.slice(0, innerWidth - 13) + "…"
 				: state.auditFeedback;
-			out.push(`  ${style.bold(style.fg("warning", trimmed))}`);
+			out.push(`  ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
 		}
 
 		out.push(style.fg("dim", hr));
@@ -322,6 +347,55 @@ function styleTaskLine(line: string, style: ReturnType<typeof makeStyleHelpers>,
 	// Reattach the leading marker
 	const marker = isCurrent ? style.bold(style.fg("accent", "▶")) : " ";
 	return `${marker} ${iconStyled} ${textStyled}`;
+}
+
+// ---------------------------------------------------------------------------
+// Plan widget: full task plan in a scrollable view (approval dialog companion)
+// ---------------------------------------------------------------------------
+
+// The stock ctx.ui.confirm renders the message as a non-scrollable title in a
+// selector with only Yes/No options, so long plans get clipped and the user
+// cannot scroll up to read them. Instead we render the full plan into a
+// ScrollView widget above the editor (wheel-scrollable) and keep the confirm
+// dialog itself short.
+
+const PLAN_WIDGET_KEY = "pi-goal-plan";
+
+function buildPlanLines(params: { refinedGoal: string; tasks: { id: string; description: string; contract: string; acceptanceCriteria: string[] }[] }): string[] {
+	const lines: string[] = [];
+	lines.push("Refined Goal:");
+	lines.push(`  ${params.refinedGoal}`);
+	lines.push("");
+	lines.push(`Tasks (${params.tasks.length}):`);
+	for (let i = 0; i < params.tasks.length; i++) {
+		const t = params.tasks[i];
+		lines.push("");
+		lines.push(`${i + 1}. ${t.description}  [${t.id}]`);
+		lines.push(`   Contract: ${t.contract}`);
+		lines.push(`   Verify: ${t.acceptanceCriteria.join("; ")}`);
+	}
+	return lines;
+}
+
+function setPlanWidget(ctx: ExtensionContext, lines: string[]): void {
+	const container = new Container();
+	for (const line of lines) {
+		container.addChild(new Text(line, 1, 0));
+	}
+	const scroll = new ScrollView(container, {
+		axis: "vertical",
+		follow: "none",
+		overscroll: "chain",
+		scrollbar: "auto",
+	});
+	// The factory form is required to hand the host a component. The host
+	// invokes the factory once and keeps the returned component, so we can
+	// return the same ScrollView instance (its scroll state is preserved).
+	ctx.ui.setWidget(PLAN_WIDGET_KEY, () => scroll);
+}
+
+function clearPlanWidget(ctx: ExtensionContext): void {
+	ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -577,13 +651,19 @@ export default function (pi: ExtensionAPI) {
 			saveState(state);
 			refreshWidget(ctx as ExtensionContext);
 
-			const planLines = params.tasks.map(
-				(t, i) =>
-					`${i + 1}. ${t.description}\n   Contract: ${t.contract}\n   Verify: ${t.acceptanceCriteria.join("; ")}`,
-			);
-			const display = `Refined Goal: ${params.refinedGoal}\n\nTasks:\n${planLines.join("\n\n")}`;
+			const planLines = buildPlanLines(params);
 
-			const approved = await ctx.ui.confirm("Goal Plan", `${display}\n\nApprove this plan?`);
+			// Render the full plan into a scrollable widget above the editor.
+			// The stock confirm dialog cannot scroll its message, so the user
+			// would only ever see the first screenful of the plan.
+			setPlanWidget(ctx as ExtensionContext, planLines);
+
+			let approved: boolean;
+			try {
+				approved = await ctx.ui.confirm("Goal Plan", "The full plan is shown above the editor (scroll to review). Approve this plan?");
+			} finally {
+				clearPlanWidget(ctx as ExtensionContext);
+			}
 
 			if (approved) {
 				state.tasks = state.tasks.map((t) => ({ ...t, status: "approved" as const }));
