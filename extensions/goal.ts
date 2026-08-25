@@ -40,9 +40,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Container, Text } from "@earendil-works/pi-tui";
-import { ScrollView } from "@earendil-works/pi-tui";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Container, ScrollView, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 let yoloMode = false;
@@ -255,7 +253,14 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 		// ── Left column: task list (plain strings, styled at merge time) ──
 		const leftPlain: string[] = [];
 		leftPlain.push("Tasks");
-		for (const task of state.tasks) {
+		const MAX_TASK_ROWS = 10;
+		for (let i = 0; i < state.tasks.length; i++) {
+			if (i >= MAX_TASK_ROWS) {
+				const remaining = state.tasks.length - MAX_TASK_ROWS;
+				leftPlain.push(` ... and ${remaining} more`);
+				break;
+			}
+			const task = state.tasks[i];
 			let icon: string;
 			let note: string;
 			if (!task.auditResult) {
@@ -269,8 +274,8 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 				note = "FAIL";
 			}
 			const maxDesc = leftW - 12;
-			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "..." : task.description;
-			leftPlain.push(` ${icon} ${desc.padEnd(maxDesc - 4, " ")} ${note}`);
+			const desc = truncateToWidth(task.description, maxDesc - 4, "...", true);
+			leftPlain.push(` ${icon} ${desc} ${note}`);
 		}
 
 		// ── Right column: auditor token stream (plain strings, styled at merge) ──
@@ -279,10 +284,10 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 		const log = state.auditLog || [];
 
 		if (log.length > 0) {
-			const maxLines = Math.max(state.tasks.length + 1, 6);
+			const maxLines = 15;
 			const start = Math.max(0, log.length - maxLines);
 			for (let i = start; i < log.length; i++) {
-				const trimmed = log[i].length > rightW - 4 ? log[i].slice(0, rightW - 7) + "..." : log[i];
+				const trimmed = truncateToWidth(sanitizeLogLine(log[i]), Math.max(1, rightW - 4), "...", false);
 				rightPlain.push(trimmed);
 			}
 		} else {
@@ -319,9 +324,7 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 
 		// Verdict footer when audit is done
 		if (state.auditFeedback && state.auditFeedback !== "auditor pending..." && log.length > 0) {
-			const trimmed = state.auditFeedback.length > innerWidth - 4
-				? state.auditFeedback.slice(0, innerWidth - 5) + "..."
-				: state.auditFeedback;
+			const trimmed = truncateToWidth(state.auditFeedback, innerWidth - 10, "...", false);
 			out.push(` ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
 		}
 
@@ -609,10 +612,14 @@ const auditVerdictTool = defineTool({
 	},
 });
 
+function sanitizeLogLine(text: string): string {
+	return text.replace(/[\r\n]+/g, " ");
+}
+
 function appendAuditLog(lines: string[]): void {
 	const state = loadState();
 	if (!state || state.status !== "auditing") return;
-	state.auditLog = [...(state.auditLog || []), ...lines];
+	state.auditLog = [...(state.auditLog || []), ...lines.map(sanitizeLogLine)];
 	saveState(state);
 }
 
@@ -632,7 +639,7 @@ function scheduleAuditThinkingFlush(text: string): void {
 		const st = loadState();
 		if (!st || st.status !== "auditing") return;
 		const tail = st.auditLog[st.auditLog.length - 1];
-		const line = "thinking: " + text.trim();
+		const line = "thinking: " + sanitizeLogLine(text.trim());
 		if (tail && tail.startsWith("thinking: ")) {
 			st.auditLog[st.auditLog.length - 1] = line;
 		} else {
@@ -646,8 +653,8 @@ function scheduleAuditThinkingFlush(text: string): void {
 function auditLogError(message: string): void {
 	const state = loadState();
 	if (!state || state.status !== "auditing") return;
-	state.auditLog = [...(state.auditLog || []), message];
-	state.auditFeedback = message.replace(/^[+x]\s*/, "");
+	state.auditLog = [...(state.auditLog || []), sanitizeLogLine(message)];
+	state.auditFeedback = sanitizeLogLine(message).replace(/^[+x]\s*/, "");
 	saveState(state);
 }
 
@@ -671,7 +678,7 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 			status: "completed" as const,
 			auditResult: params.feedback,
 		}));
-		state.auditLog = [...(state.auditLog || []), `PASSED: ${params.feedback}`];
+		state.auditLog = [...(state.auditLog || []), `PASSED: ${sanitizeLogLine(params.feedback)}`];
 		saveState(state);
 		return { approved: true, failedTaskCount: 0 };
 	}
@@ -690,9 +697,9 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 		}
 		return { ...t, status: "completed" as const, auditResult: params.feedback };
 	});
-	state.auditLog = [...(state.auditLog || []), `REJECTED: ${params.feedback}`];
+	state.auditLog = [...(state.auditLog || []), `REJECTED: ${sanitizeLogLine(params.feedback)}`];
 	for (const ft of params.failedTasks || []) {
-		state.auditLog.push(`  - ${ft.id}: ${ft.reason}`);
+		state.auditLog.push(`  - ${ft.id}: ${sanitizeLogLine(ft.reason)}`);
 	}
 	saveState(state);
 	return { approved: false, failedTaskCount: failedIds.size };
