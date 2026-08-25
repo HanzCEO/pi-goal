@@ -841,22 +841,8 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 			const st = loadState();
 			if (st && st.status === "active") {
 				// Rejected: hand the failing tasks back to the main agent.
-				const failed = st.tasks.filter((t) => t.status !== "completed");
-				const failedList = failed
-					.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
-					.join("\n");
-				const msg: Array<{ type: "text"; text: string }> = [
-					{
-						type: "text",
-						text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${st.auditFeedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
-					},
-				];
-				if (ctx.isIdle()) {
-					api.sendUserMessage(msg);
-				} else {
-					// Agent is still finishing its turn; queue until it settles.
-					api.sendUserMessage(msg, { deliverAs: "followUp" });
-				}
+				// goal_complete.execute() returns the verdict to the agent directly
+				// via the tool result — no follow-up message needed.
 				return { approved: false, feedback: st.auditFeedback || "No feedback provided" };
 			} else if (st && st.status === "completed") {
 				return { approved: true, feedback: st.auditFeedback || "All criteria met" };
@@ -1243,20 +1229,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Rejected: hand the failing tasks back to the main agent.
+			// The tool return value carries the full verdict to the agent — no
+			// separate follow-up needed now that the tool call is already closed.
 			const st = loadState();
 			const failed = (st?.tasks || []).filter((t) => t.status !== "completed");
 			const failedList = failed
 				.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
 				.join("\n");
 
+			const feedback = result.feedback;
+			const text = `Audit rejected. Tasks reset to pending.\n\n**Auditor feedback:** ${feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks, then call goal_complete again.`;
+
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Audit rejected. Tasks reset to pending.\n\n**Auditor feedback:** ${result.feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks, then call goal_complete again.`,
-					},
-				],
-				details: { submittedForAudit: true, approved: false, feedback: result.feedback },
+				content: [{ type: "text", text }],
+				details: { submittedForAudit: true, approved: false, feedback },
 			};
 		},
 	});
