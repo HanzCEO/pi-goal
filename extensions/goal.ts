@@ -45,6 +45,7 @@ import { ScrollView } from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
+let yoloMode = false;
 
 const buildGoalInstructionPrompt = (topic: string): string =>
 	`I want to accomplish this goal: ${topic}
@@ -55,6 +56,7 @@ Work through it step by step:
    - open_ended (default) for free-text input
    - multiple_answers when several independent choices are valid
    - radio_answers when picking a single option from a list (pass options=[])
+   Ask ONE question at a time. Do not combine multiple clarifying questions into a single goal_ask call \u2014 each question is asked separately.
    Keep asking until you have a clear, actionable goal.
 
 2. **Plan** \u2014 Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
@@ -232,12 +234,13 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 
 	// Header row: GOAL (paraphrased)
 	const headerLabel = style.bold(style.fg("accent", "GOAL"));
+	const yoloBadge = yoloMode ? style.bold(style.fg("warning", " YOLO ")) : "";
 	const statusBadge = state.status === "auditing"
 		? style.bold(style.fg("warning", " AUDITING "))
 		: state.status === "paused"
 			? style.bold(style.fg("muted", " PAUSED "))
 			: style.fg("muted", " active ");
-	out.push(`${headerLabel}${style.fg("dim", " · ")}${style.italic(paraphrased)}${style.fg("dim", "  ")}${statusBadge}`);
+	out.push(`${headerLabel}${style.fg("dim", " · ")}${style.italic(paraphrased)}${style.fg("dim", "  ")}${yoloBadge}${statusBadge}`);
 
 	// Divider
 	out.push(style.fg("dim", hr));
@@ -898,7 +901,7 @@ export default function (pi: ExtensionAPI) {
 		name: "goal_ask",
 		label: "Ask about goal",
 		description:
-			"Ask the user a clarifying question. Use open_ended for free-text input, multiple_answers for comma-separated values, or radio_answers for a single choice from options. Options lists automatically include \"Others (custom answer)\" as an escape hatch.",
+			"Ask the user a clarifying question. Use open_ended for free-text input, multiple_answers for comma-separated values, or radio_answers for a single choice from options. Options lists automatically include \"Others (custom answer)\" as an escape hatch. The first option in radio_answers is recommended and is shown with a \"*\" prefix.",
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask the user" }),
 			type: Type.Optional(
@@ -913,6 +916,9 @@ export default function (pi: ExtensionAPI) {
 			),
 			options: Type.Optional(
 				Type.Array(Type.String(), { description: "Options for radio_answers and multiple_answers" }),
+			),
+			recommended: Type.Optional(
+				Type.String({ description: "Recommended option for radio_answers. If not set, the first option is the recommended one." }),
 			),
 		}),
 		executionMode: "sequential",
@@ -938,40 +944,58 @@ export default function (pi: ExtensionAPI) {
 						details: { question, type, answer: null },
 					};
 				}
-				const selectOptions = [...options, CUSTOM_OPTION];
-				const choice = await ctx.ui.select(question, selectOptions);
-				if (choice === CUSTOM_OPTION) {
-					const custom = await ctx.ui.input(`${question} (custom answer)`, "Type your answer");
-					answer = custom ?? null;
+				const recommended = params.recommended || options[0];
+				const displayOptions = options.map((opt) => (opt === recommended ? `* ${opt}` : opt));
+				if (yoloMode) {
+					answer = recommended;
 				} else {
-					answer = choice ?? null;
+					const selectOptions = [...displayOptions, CUSTOM_OPTION];
+					const choice = await ctx.ui.select(question, selectOptions);
+					const strippedChoice = choice?.replace(/^\* /, "") ?? null;
+					if (strippedChoice === CUSTOM_OPTION) {
+						const custom = await ctx.ui.input(`${question} (custom answer)`, "Type your answer");
+						answer = custom ?? null;
+					} else {
+						answer = strippedChoice ?? null;
+					}
 				}
 			} else if (type === "multiple_answers") {
-				const allOptions = options.length > 0 ? [...options, CUSTOM_OPTION] : [CUSTOM_OPTION];
-				const placeholder = `Comma-separated values. Options: ${allOptions.join(", ")}`;
-				const raw = await ctx.ui.input(question, placeholder);
-				if (raw) {
-					const parts = raw
-						.split(",")
-						.map((s) => s.trim())
-						.filter((s) => s.length > 0);
-					const otherIdx = parts.findIndex(
-						(p) => p.toLowerCase() === CUSTOM_OPTION.toLowerCase() || p.toLowerCase() === "others",
-					);
-					if (otherIdx !== -1) {
-						const custom = await ctx.ui.input(`${question} (custom answer)`, "Type your custom answer");
-						if (custom) {
-							parts[otherIdx] = custom.trim();
-						} else {
-							parts.splice(otherIdx, 1);
-						}
-					}
-					answer = parts;
+				if (yoloMode) {
+					const recommended = params.recommended || (options.length > 0 ? options[0] : "");
+					answer = recommended ? [recommended] : [];
 				} else {
-					answer = null;
+					const allOptions = options.length > 0 ? [...options, CUSTOM_OPTION] : [CUSTOM_OPTION];
+					const placeholder = `Comma-separated values. Options: ${allOptions.join(", ")}`;
+					const raw = await ctx.ui.input(question, placeholder);
+					if (raw) {
+						const parts = raw
+							.split(",")
+							.map((s) => s.trim())
+							.filter((s) => s.length > 0);
+						const otherIdx = parts.findIndex(
+							(p) => p.toLowerCase() === CUSTOM_OPTION.toLowerCase() || p.toLowerCase() === "others",
+						);
+						if (otherIdx !== -1) {
+							const custom = await ctx.ui.input(`${question} (custom answer)`, "Type your custom answer");
+							if (custom) {
+								parts[otherIdx] = custom.trim();
+							} else {
+								parts.splice(otherIdx, 1);
+							}
+						}
+						answer = parts;
+					} else {
+						answer = null;
+					}
 				}
 			} else {
 				// open_ended
+				if (yoloMode) {
+					return {
+						content: [{ type: "text", text: "Error: open-ended questions are not available in yolo mode. Use radio_answers or multiple_answers instead." }],
+						details: { question, type, answer: null, yoloBlocked: true },
+					};
+				}
 				const raw = await ctx.ui.input(question, "Type your answer and press Enter");
 				answer = raw ?? null;
 			}
@@ -1051,7 +1075,13 @@ export default function (pi: ExtensionAPI) {
 
 			let choice: string | undefined;
 			try {
-				choice = await ctx.ui.select("Goal Plan", ["Yes, proceed", "No, revise", "I have a comment"]);
+				if (yoloMode) {
+					// Show plan widget briefly, then auto-confirm after 1.5s
+					choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
+					if (choice === undefined) choice = "Yes, proceed";
+				} else {
+					choice = await ctx.ui.select("Goal Plan", ["Yes, proceed", "No, revise", "I have a comment"]);
+				}
 			} finally {
 				clearPlanWidget(ctx as ExtensionContext);
 			}
@@ -1443,6 +1473,25 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 				]);
 
 			ctx.ui.notify("Goal resumed. Agent is picking up where it left off.", "info");
+		},
+	});
+
+	pi.registerCommand("goal-yolo", {
+		description: "Toggle yolo mode. When on: open-ended questions are blocked, recommended answers are auto-selected, and goal plans are auto-approved.",
+		handler: async (args, ctx) => {
+			const arg = args.trim().toLowerCase();
+			if (arg === "on") {
+				yoloMode = true;
+				ctx.ui.notify("YOLO mode ON. Open-ended questions blocked, recommended answers auto-selected, plans auto-approved.", "info");
+			} else if (arg === "off") {
+				yoloMode = false;
+				ctx.ui.notify("YOLO mode OFF.", "info");
+			} else {
+				const status = yoloMode ? "ON" : "OFF";
+				ctx.ui.notify(`YOLO mode is currently ${status}. Use /goal-yolo on or /goal-yolo off to change.`, "info");
+				return;
+			}
+			if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
 		},
 	});
 
