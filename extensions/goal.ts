@@ -822,7 +822,12 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` -> ${summary}` : ""}`]);
 				if (event.toolName === "goal_audit_result") {
 					// The verdict tool already applied the result via its own
-					// execute; stop here.
+					// execute, so generation is done; abort the auditor session
+					// to stop token generation before any follow-up turn. A
+					// failed verdict call is left alone so the audit can continue.
+					if (!event.isError) {
+						void session.abort();
+					}
 					return;
 				}
 				return;
