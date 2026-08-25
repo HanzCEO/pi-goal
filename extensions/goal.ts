@@ -46,6 +46,57 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
+const buildGoalInstructionPrompt = (topic: string): string =>
+	`I want to accomplish this goal: ${topic}
+
+Work through it step by step:
+
+1. **Refine** \u2014 If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Use the right question type:
+   - open_ended (default) for free-text input
+   - multiple_answers when several independent choices are valid
+   - radio_answers when picking a single option from a list (pass options=[])
+   Keep asking until you have a clear, actionable goal.
+
+2. **Plan** \u2014 Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
+
+3. **Approve** \u2014 Use goal_approve_plan to submit the refined goal and task list for my approval. If I reject it, revise and resubmit.
+
+4. **Execute** \u2014 Once approved, execute each task. Prefer spawning isolated subagents (fresh-context, worktree-isolated) per task so each one has a clean start. After each task, verify it yourself with a fresh, critical eye, then immediately call goal_update_task to mark it "completed". Do not move on to the next task before marking the current one done.
+
+5. **Mark done** \u2014 After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate \u2014 mark it done right after verification.
+
+6. **Complete** \u2014 When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
+
+7. **Audit result** \u2014 goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict; you do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
+
+The state file at .pi/goal/state.json is updated automatically. You can read it to track progress.`;
+
+const AUDITOR_SYSTEM_PROMPT_TEMPLATE = `You are the goal auditor for an agentic workflow. Your job is to verify, with a fresh and critical eye, that the work delivered for a goal actually meets every acceptance criterion. You are an independent reviewer: trust nothing, verify everything yourself.
+
+You have read-only verification tools (read, bash, grep, find, ls) plus write/edit only when you must create test artifacts; you must NEVER modify the goal's state file (.pi/goal/state.json).
+
+## Goal
+__GOAL__
+
+## Claimed work summary (from the executor)
+__RESULT__
+
+## Tasks and acceptance criteria to verify
+__TASKS__
+
+## Procedure
+1. Read the current state from .pi/goal/state.json to see what the executor claims.
+2. For each task, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
+3. Keep working until every criterion is either verified or disproven.
+
+## Verdict
+When you are done, call the tool goal_audit_result exactly once with:
+- approved: true if EVERY acceptance criterion of EVERY task is met, else false.
+- feedback: a concise verdict explaining what you verified and, on rejection, what failed.
+- failedTasks: only when approved=false, the list of { id, reason } for each task that did not meet its criteria. Omit the field when approved=true.
+
+Be strict but fair. A single unmet criterion means rejection.`;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -133,23 +184,23 @@ function buildTaskWindow(tasks: TaskState[], currentIndex: number, availWidth: n
 	// Center the window around the current task: show t-1, t, t+1, t+2.
 	const start = Math.max(0, currentIndex - 1);
 	const end = Math.min(tasks.length, start + maxLines);
-	const prefixLen = 4; // "▶ ○ " = 4 chars
+	const prefixLen = 4; // "> o " = 4 chars
 	const maxDescLen = Math.max(10, availWidth - prefixLen);
 	const lines: string[] = [];
 	for (let i = start; i < end; i++) {
 		const task = tasks[i];
-		const marker = i === currentIndex ? "▶" : " ";
+		const marker = i === currentIndex ? ">" : " ";
 		const icon =
 			task.status === "completed"
-				? "✓"
+				? "+"
 				: task.status === "failed"
-					? "✗"
+					? "x"
 					: task.status === "in-progress"
-						? "→"
+						? ">"
 						: task.status === "approved"
-							? "◉"
-						: "○";
-		const desc = task.description.length > maxDescLen ? task.description.slice(0, maxDescLen - 1) + "…" : task.description;
+							? "*"
+						: "o";
+		const desc = task.description.length > maxDescLen ? task.description.slice(0, maxDescLen - 1) + "..." : task.description;
 		lines.push(`${marker} ${icon} ${desc}`);
 	}
 	return lines.join("\n");
@@ -179,8 +230,8 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 
 	const out: string[] = [];
 
-	// Header row: ◆ GOAL (paraphrased)
-	const headerLabel = style.bold(style.fg("accent", "◆ GOAL"));
+	// Header row: GOAL (paraphrased)
+	const headerLabel = style.bold(style.fg("accent", "GOAL"));
 	const statusBadge = state.status === "auditing"
 		? style.bold(style.fg("warning", " AUDITING "))
 		: state.status === "paused"
@@ -205,17 +256,17 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			let icon: string;
 			let note: string;
 			if (!task.auditResult) {
-				icon = "◐";
-				note = "verifying…";
+				icon = "?";
+				note = "verifying...";
 			} else if (task.status === "completed") {
-				icon = "✓";
+				icon = "+";
 				note = "ok";
 			} else {
-				icon = "✗";
+				icon = "x";
 				note = "FAIL";
 			}
 			const maxDesc = leftW - 12;
-			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "…" : task.description;
+			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "..." : task.description;
 			leftPlain.push(` ${icon} ${desc.padEnd(maxDesc, " ")} ${note}`);
 		}
 
@@ -228,7 +279,7 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			const maxLines = Math.max(state.tasks.length + 1, 6);
 			const start = Math.max(0, log.length - maxLines);
 			for (let i = start; i < log.length; i++) {
-				const trimmed = log[i].length > rightW - 4 ? log[i].slice(0, rightW - 7) + "…" : log[i];
+				const trimmed = log[i].length > rightW - 4 ? log[i].slice(0, rightW - 7) + "..." : log[i];
 				rightPlain.push(trimmed);
 			}
 		} else {
@@ -251,10 +302,10 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			const lFinal =
 				i === 0
 					? style.fg("muted", lRaw + lPad)
-					: lRaw.trimStart().startsWith("✓")
-						? style.fg("text", " " + style.fg("success", "✓") + lRaw.slice(2) + lPad)
-						: lRaw.trimStart().startsWith("✗")
-							? style.fg("text", " " + style.fg("error", "✗") + lRaw.slice(2) + lPad)
+					: lRaw.trimStart().startsWith("+")
+						? style.fg("text", " " + style.fg("success", "+") + lRaw.slice(2) + lPad)
+						: lRaw.trimStart().startsWith("x")
+							? style.fg("text", " " + style.fg("error", "x") + lRaw.slice(2) + lPad)
 							: style.fg("text", lRaw + lPad);
 
 			const rRaw = i < rightPlain.length ? rightPlain[i] : "";
@@ -266,7 +317,7 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 		// Verdict footer when audit is done
 		if (state.auditFeedback && state.auditFeedback !== "auditor pending..." && log.length > 0) {
 			const trimmed = state.auditFeedback.length > innerWidth - 4
-				? state.auditFeedback.slice(0, innerWidth - 5) + "…"
+				? state.auditFeedback.slice(0, innerWidth - 5) + "..."
 				: state.auditFeedback;
 			out.push(` ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
 		}
@@ -339,34 +390,35 @@ function makeProgressBar(done: number, total: number, width: number, style: Retu
 }
 
 function styleTaskLine(line: string, style: ReturnType<typeof makeStyleHelpers>, currentIndex: number): string {
-	// Lines look like: "▶ →  do the thing" or "   ✓ done"
-	const isCurrent = line.trimStart().startsWith("▶");
-	const trimmed = line.trimStart().replace(/^[▶ ]\s*/, "");
-	const iconMatch = trimmed.match(/^([✓✗→◉○])\s+(.*)$/);
+	// Lines look like: "> >  do the thing" or "   + done"
+	const isCurrent = line.trimStart().startsWith(">");
+	const trimmed = line.trimStart().replace(/^[> ]\s*/, "");
+	const iconMatch = trimmed.match(/^([+x>*o])\s+(.*)$/);
 	if (!iconMatch) return line;
 	const icon = iconMatch[1];
 	const text = iconMatch[2];
 	const iconStyled =
-		icon === "✓"
-			? style.fg("success", "✓")
-			: icon === "✗"
-				? style.fg("error", "✗")
-				: icon === "→"
-					? style.fg("accent", "→")
-					: icon === "◉"
-						? style.fg("muted", "◉")
-						: style.fg("dim", "○");
+		icon === "+"
+			? style.fg("success", "+")
+			: icon === "x"
+				? style.fg("error", "x")
+				: icon === ">"
+					? style.fg("accent", ">")
+					: icon === "*"
+						? style.fg("muted", "*")
+						: style.fg("dim", "o");
 	const textStyled = isCurrent
 		? style.bold(style.fg("text", text))
-		: icon === "✓"
+		: icon === "+"
 			? style.fg("muted", text)
-			: icon === "✗"
+			: icon === "x"
 				? style.fg("error", text)
 				: style.fg("text", text);
 	// Reattach the leading marker
-	const marker = isCurrent ? style.bold(style.fg("accent", "▶")) : " ";
+	const marker = isCurrent ? style.bold(style.fg("accent", ">")) : " ";
 	return `${marker} ${iconStyled} ${textStyled}`;
 }
+
 
 // ---------------------------------------------------------------------------
 // Plan widget: full task plan in a scrollable view (approval dialog companion)
@@ -513,7 +565,7 @@ function stopWatcher(): void {
 
 const AUDITOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
-let auditInFlight: Promise<void> | null = null;
+let auditInFlight: Promise<{ approved: boolean; feedback: string } | null> | null = null;
 let auditFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 // The verdict tool injected into the auditor session. It applies the verdict
@@ -577,8 +629,8 @@ function scheduleAuditThinkingFlush(text: string): void {
 		const st = loadState();
 		if (!st || st.status !== "auditing") return;
 		const tail = st.auditLog[st.auditLog.length - 1];
-		const line = "💭 " + text.trim();
-		if (tail && tail.startsWith("💭 ")) {
+		const line = "thinking: " + text.trim();
+		if (tail && tail.startsWith("thinking: ")) {
 			st.auditLog[st.auditLog.length - 1] = line;
 		} else {
 			st.auditLog = [...(st.auditLog || []), line];
@@ -592,7 +644,7 @@ function auditLogError(message: string): void {
 	const state = loadState();
 	if (!state || state.status !== "auditing") return;
 	state.auditLog = [...(state.auditLog || []), message];
-	state.auditFeedback = message.replace(/^[✓✗]\s*/, "");
+	state.auditFeedback = message.replace(/^[+x]\s*/, "");
 	saveState(state);
 }
 
@@ -616,7 +668,7 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 			status: "completed" as const,
 			auditResult: params.feedback,
 		}));
-		state.auditLog = [...(state.auditLog || []), `✓ Approved: ${params.feedback}`];
+		state.auditLog = [...(state.auditLog || []), `PASSED: ${params.feedback}`];
 		saveState(state);
 		return { approved: true, failedTaskCount: 0 };
 	}
@@ -635,7 +687,7 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 		}
 		return { ...t, status: "completed" as const, auditResult: params.feedback };
 	});
-	state.auditLog = [...(state.auditLog || []), `✗ Rejected: ${params.feedback}`];
+	state.auditLog = [...(state.auditLog || []), `REJECTED: ${params.feedback}`];
 	for (const ft of params.failedTasks || []) {
 		state.auditLog.push(`  - ${ft.id}: ${ft.reason}`);
 	}
@@ -684,39 +736,18 @@ function buildAuditorSystemPrompt(state: GoalState): string {
 			return `  ${i + 1}. ${t.id}: ${t.description}\n     contract: ${t.contract}\n     acceptance criteria:\n${criteria}`;
 		})
 		.join("\n\n");
-	return `You are the goal auditor for an agentic workflow. Your job is to verify, with a fresh and critical eye, that the work delivered for a goal actually meets every acceptance criterion. You are an independent reviewer: trust nothing, verify everything yourself.
-
-You have read-only verification tools (read, bash, grep, find, ls) plus write/edit only when you must create test artifacts; you must NEVER modify the goal's state file (.pi/goal/state.json).
-
-## Goal
-${state.refinedGoal || state.goal}
-
-## Claimed work summary (from the executor)
-${state.result || "(none provided)"}
-
-## Tasks and acceptance criteria to verify
-${tasks}
-
-## Procedure
-1. Read the current state from .pi/goal/state.json to see what the executor claims.
-2. For each task, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
-3. Keep working until every criterion is either verified or disproven.
-
-## Verdict
-When you are done, call the tool goal_audit_result exactly once with:
-- approved: true if EVERY acceptance criterion of EVERY task is met, else false.
-- feedback: a concise verdict explaining what you verified and, on rejection, what failed.
-- failedTasks: only when approved=false, the list of { id, reason } for each task that did not meet its criteria. Omit the field when approved=true.
-
-Be strict but fair. A single unmet criterion means rejection.`;
+	return AUDITOR_SYSTEM_PROMPT_TEMPLATE
+		.replace("__GOAL__", state.refinedGoal || state.goal)
+		.replace("__RESULT__", state.result || "(none provided)")
+		.replace("__TASKS__", tasks);
 }
 
-function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
+function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved: boolean; feedback: string } | null> {
 	if (auditInFlight) return auditInFlight;
 
 	auditInFlight = (async () => {
 		const state = loadState();
-		if (!state || state.status !== "auditing") return;
+		if (!state || state.status !== "auditing") return null;
 
 		appendAuditLog(["spawning isolated auditor..."]);
 
@@ -724,7 +755,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 		try {
 			modelRuntime = await ModelRuntime.create();
 		} catch (err) {
-			auditLogError(`✗ could not initialize model runtime: ${(err as Error).message}`);
+			auditLogError(`FAILED: could not initialize model runtime: ${(err as Error).message}`);
 			throw err;
 		}
 
@@ -778,14 +809,14 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 
 			if (event.type === "tool_execution_start") {
 				const arg = summarizeArgs(event.toolName, event.args);
-				appendAuditLog([`▶ ${event.toolName}${arg ? ` ${arg}` : ""}`]);
+				appendAuditLog([`tool: ${event.toolName}${arg ? ` ${arg}` : ""}`]);
 				return;
 			}
 
 			if (event.type === "tool_execution_end") {
 				const summary = summarizeResult(event.result);
-				const marker = event.isError ? "✗" : "✓";
-				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` → ${summary}` : ""}`]);
+				const marker = event.isError ? "FAIL" : "ok";
+				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` -> ${summary}` : ""}`]);
 				if (event.toolName === "goal_audit_result") {
 					// The verdict tool already applied the result via its own
 					// execute; stop here.
@@ -804,18 +835,8 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 				"Audit the goal now. Read .pi/goal/state.json first, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
 			);
 
-			// Finalize once the audit run completes: if the verdict tool was
-			// never called (e.g. the auditor stopped early), surface that the
-			// goal is still pending and unstick the widget.
 			const st = loadState();
-			if (st && st.status === "auditing") {
-				const log = st.auditLog || [];
-				const hasVerdict = log.some((l) => l.startsWith("✓ Approved") || l.startsWith("✗ Rejected"));
-				if (!hasVerdict) {
-					st.auditLog = [...log, "⚠ auditor stopped without a verdict. Call goal_complete again to re-audit."];
-					saveState(st);
-				}
-			} else if (st && st.status === "active") {
+			if (st && st.status === "active") {
 				// Rejected: hand the failing tasks back to the main agent.
 				const failed = st.tasks.filter((t) => t.status !== "completed");
 				const failedList = failed
@@ -833,11 +854,11 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 					// Agent is still finishing its turn; queue until it settles.
 					api.sendUserMessage(msg, { deliverAs: "followUp" });
 				}
+				return { approved: false, feedback: st.auditFeedback || "No feedback provided" };
 			} else if (st && st.status === "completed") {
-				clearWidget(ctx);
-				ctx.ui.setStatus("pi-goal", "");
-				ctx.ui.notify(`Goal audited and completed.\n\n${st.auditFeedback}`, "info");
+				return { approved: true, feedback: st.auditFeedback || "All criteria met" };
 			}
+			return null;
 		} finally {
 			unsubscribe();
 			session.dispose();
@@ -846,7 +867,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<void> {
 		auditInFlight = null;
 	});
 
-	return auditInFlight;
+	return auditInFlight!;
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,14 +1049,14 @@ export default function (pi: ExtensionAPI) {
 			// would only ever see the first screenful of the plan.
 			setPlanWidget(ctx as ExtensionContext, planLines);
 
-			let approved: boolean;
+			let choice: string | undefined;
 			try {
-				approved = await ctx.ui.confirm("Goal Plan", "The full plan is shown above the editor (scroll to review). Approve this plan?");
+				choice = await ctx.ui.select("Goal Plan", ["Yes, proceed", "No, revise", "I have a comment"]);
 			} finally {
 				clearPlanWidget(ctx as ExtensionContext);
 			}
 
-			if (approved) {
+			if (choice === "Yes, proceed") {
 				state.tasks = state.tasks.map((t) => ({ ...t, status: "approved" as const }));
 				saveState(state);
 				refreshWidget(ctx as ExtensionContext);
@@ -1044,6 +1065,17 @@ export default function (pi: ExtensionAPI) {
 					details: { approved: true, refinedGoal: params.refinedGoal, tasks: params.tasks },
 				};
 			}
+
+			if (choice === "I have a comment") {
+				const comment = await ctx.ui.input("Your feedback on the plan", "Type your comment and press Enter");
+				if (comment) {
+					return {
+						content: [{ type: "text", text: `User commented: ${comment}` }],
+						details: { approved: false, comment, refinedGoal: params.refinedGoal, tasks: params.tasks },
+					};
+				}
+			}
+
 			return {
 				content: [{ type: "text", text: "Plan rejected. Revise and resubmit." }],
 				details: { approved: false },
@@ -1108,7 +1140,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Complete goal",
 		description:
 			"Submit the goal for audit. Requires every task to be marked completed first. " +
-			"This spawns an isolated auditor in the background that streams its activity into the panel. Do not attempt to spawn the auditor yourself.",
+			"This spawns an isolated auditor that blocks until the verdict is delivered. Do not attempt to spawn the auditor yourself.",
 		parameters: Type.Object({
 			summary: Type.String({ description: "Summary of what was accomplished" }),
 		}),
@@ -1148,27 +1180,41 @@ export default function (pi: ExtensionAPI) {
 			refreshWidget(ctx as ExtensionContext);
 
 			// Spawn the isolated auditor in-process and stream its activity
-			// into the widget panel. Fire-and-forget: the tool returns
-			// immediately while the audit runs in the background.
-			runAudit(ctx as ExtensionContext, pi).catch((err) => {
-				const s = loadState();
-				if (s && s.status === "auditing") {
-					s.status = "active";
-					s.auditFeedback = `Audit failed: ${(err as Error).message}`;
-					s.auditLog = [...(s.auditLog || []), `✗ Audit failed: ${(err as Error).message}`];
-					saveState(s);
-					refreshWidget(ctx as ExtensionContext);
-				}
-			});
+			// into the widget panel. The tool blocks until the audit finishes.
+			const result = await runAudit(ctx as ExtensionContext, pi);
+
+			if (result === null) {
+				return {
+					content: [{ type: "text", text: "Audit did not complete. No verdict was reached." }],
+					details: { submittedForAudit: true, approved: false, error: "no_verdict" },
+				};
+			}
+
+			if (result.approved) {
+				clearWidget(ctx as ExtensionContext);
+				ctx.ui.setStatus("pi-goal", "");
+				ctx.ui.notify(`Goal audited and completed.\n\n${result.feedback}`, "info");
+				return {
+					content: [{ type: "text", text: `Audit passed. Goal completed.\n\n${result.feedback}` }],
+					details: { submittedForAudit: true, approved: true, feedback: result.feedback },
+				};
+			}
+
+			// Rejected: hand the failing tasks back to the main agent.
+			const st = loadState();
+			const failed = (st?.tasks || []).filter((t) => t.status !== "completed");
+			const failedList = failed
+				.map((t) => `- ${t.id}: ${t.description} (${t.error || "criteria not met"})`)
+				.join("\n");
 
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Goal submitted for audit. The auditor is running in the background — its activity streams into the panel above. The verdict arrives via goal_audit_result.`,
+						text: `Audit rejected. Tasks reset to pending.\n\n**Auditor feedback:** ${result.feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks, then call goal_complete again.`,
 					},
 				],
-				details: { submittedForAudit: true, summary: params.summary },
+				details: { submittedForAudit: true, approved: false, feedback: result.feedback },
 			};
 		},
 	});
@@ -1301,29 +1347,7 @@ export default function (pi: ExtensionAPI) {
 			pi.sendUserMessage([
 				{
 					type: "text",
-					text: `I want to accomplish this goal: ${topic}
-
-Work through it step by step:
-
-1. **Refine** — Read the current goal state from .pi/goal/state.json. If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Use the right question type:
-   - open_ended (default) for free-text input
-   - multiple_answers when several independent choices are valid
-   - radio_answers when picking a single option from a list (pass options=[])
-   Keep asking until you have a clear, actionable goal.
-
-2. **Plan** — Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
-
-3. **Approve** — Use goal_approve_plan to submit the refined goal and task list for my approval. If I reject it, revise and resubmit.
-
-4. **Execute** — Once approved, execute each task. Prefer spawning isolated subagents (fresh-context, worktree-isolated) per task so each one has a clean start. After each task, verify it yourself with a fresh, critical eye, then immediately call goal_update_task to mark it "completed". Do not move on to the next task before marking the current one done.
-
-5. **Mark done** — After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate — mark it done right after verification.
-
-6. **Complete** — When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
-
-7. **Audit result** — goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict; you do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
-
-The state file at .pi/goal/state.json is updated automatically. You can read it to track progress.`,
+					text: buildGoalInstructionPrompt(topic),
 				},
 			]);
 		},
@@ -1345,13 +1369,13 @@ The state file at .pi/goal/state.json is updated automatically. You can read it 
 				"",
 				...state.tasks.map((t) => {
 					const icons: Record<string, string> = {
-						pending: "○",
-						approved: "◉",
-						"in-progress": "→",
-						completed: "✓",
-						failed: "✗",
+						pending: "o",
+						approved: "*",
+						"in-progress": ">",
+						completed: "+",
+						failed: "x",
 					};
-					return `  ${icons[t.status] || "○"} ${t.description} — ${t.status}`;
+					return `  ${icons[t.status] || "o"} ${t.description} — ${t.status}`;
 				}),
 			];
 
