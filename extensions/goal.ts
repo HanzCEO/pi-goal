@@ -55,7 +55,7 @@ Work through it step by step:
 1. **Refine** \u2014 If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Use the right question type:
    - open_ended (default) for free-text input
    - multiple_answers when several independent choices are valid
-   - radio_answers when picking a single option from a list (pass options=[])
+   - radio_answers when picking a single option from a list (provide the candidate answers via options, putting your recommended one first)
    Ask ONE question at a time. Do not combine multiple clarifying questions into a single goal_ask call \u2014 each question is asked separately.
    Keep asking until you have a clear, actionable goal.
 
@@ -901,7 +901,7 @@ export default function (pi: ExtensionAPI) {
 		name: "goal_ask",
 		label: "Ask about goal",
 		description:
-			"Ask the user a clarifying question. Use open_ended for free-text input, multiple_answers for comma-separated values, or radio_answers for a single choice from options. Options lists automatically include \"Others (custom answer)\" as an escape hatch. The first option in radio_answers is recommended and is shown with a \"*\" prefix.",
+			"Ask the user a clarifying question. Use open_ended for free-text input, multiple_answers for comma-separated values, or radio_answers for a single choice from options. Options lists automatically include \"Others (custom answer)\" as an escape hatch. The recommended option for radio_answers (the \"recommended\" param, or the first option when omitted) is moved to the front, marked with a \"*\" prefix, and pre-selected as the default in the UI.",
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask the user" }),
 			type: Type.Optional(
@@ -918,7 +918,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Array(Type.String(), { description: "Options for radio_answers and multiple_answers" }),
 			),
 			recommended: Type.Optional(
-				Type.String({ description: "Recommended option for radio_answers. If not set, the first option is the recommended one." }),
+				Type.String({ description: "Recommended option for radio_answers. It is moved to the front and pre-selected. If not set or not one of the options, the first option is used." }),
 			),
 		}),
 		executionMode: "sequential",
@@ -944,8 +944,15 @@ export default function (pi: ExtensionAPI) {
 						details: { question, type, answer: null },
 					};
 				}
-				const recommended = params.recommended || options[0];
-				const displayOptions = options.map((opt) => (opt === recommended ? `* ${opt}` : opt));
+				const recommended =
+					params.recommended && options.includes(params.recommended) ? params.recommended : options[0];
+				// The stock ui.select starts its cursor on the first entry, so the
+				// recommended answer has to live at index 0 to be the default
+				// selection. Normalize the order up front: recommended first, the
+				// rest in their original relative order. This also keeps the star
+				// marker on index 0 no matter where the model placed the option.
+				const orderedOptions = [recommended, ...options.filter((opt) => opt !== recommended)];
+				const displayOptions = orderedOptions.map((opt) => (opt === recommended ? `* ${opt}` : opt));
 				if (yoloMode) {
 					answer = recommended;
 				} else {
@@ -961,7 +968,12 @@ export default function (pi: ExtensionAPI) {
 				}
 			} else if (type === "multiple_answers") {
 				if (yoloMode) {
-					const recommended = params.recommended || (options.length > 0 ? options[0] : "");
+					const recommended =
+						params.recommended && options.includes(params.recommended)
+							? params.recommended
+							: options.length > 0
+								? options[0]
+								: "";
 					answer = recommended ? [recommended] : [];
 				} else {
 					const allOptions = options.length > 0 ? [...options, CUSTOM_OPTION] : [CUSTOM_OPTION];
