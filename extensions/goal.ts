@@ -270,7 +270,7 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			}
 			const maxDesc = leftW - 12;
 			const desc = task.description.length > maxDesc ? task.description.slice(0, maxDesc - 1) + "..." : task.description;
-			leftPlain.push(` ${icon} ${desc.padEnd(maxDesc, " ")} ${note}`);
+			leftPlain.push(` ${icon} ${desc.padEnd(maxDesc - 4, " ")} ${note}`);
 		}
 
 		// ── Right column: auditor token stream (plain strings, styled at merge) ──
