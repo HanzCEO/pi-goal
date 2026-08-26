@@ -850,7 +850,21 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 				"Audit the goal now. Read .pi/goal/state.json first, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
 			);
 
-			const st = loadState();
+			// The auditor can finish its turn without submitting a verdict
+			// (e.g. it ran out of context or just stopped). Follow up in the
+			// same conversation and insist it submit the verdict via the tool
+			// before giving up.
+			let st = loadState();
+			let followUps = 0;
+			while (st && st.status === "auditing" && followUps < 3) {
+				followUps += 1;
+				appendAuditLog([`auditor finished without a verdict; following up (${followUps}/3)...`]);
+				await session.prompt(
+					"You finished without submitting a verdict. You must call goal_audit_result exactly once to submit your verdict: approved (boolean), feedback (string), and on rejection the failedTasks (id and reason). If you cannot verify the goal, reject it and say why. Do not end your turn before calling the tool.",
+				);
+				st = loadState();
+			}
+
 			if (st && st.status === "active") {
 				// Rejected: hand the failing tasks back to the main agent.
 				// goal_complete.execute() returns the verdict to the agent directly
