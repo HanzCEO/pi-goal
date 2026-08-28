@@ -50,6 +50,8 @@ const buildGoalInstructionPrompt = (topic: string): string =>
 
 Work through it step by step:
 
+0. **Explore** \u2014 Before anything, explore and gain enough context about the subject matter. Don't ask the user about the goal, try to explore the codebase first. Only if you have sudden question DO IMMEDIATELY ASK the user. Do not postpone using goal_ask.
+
 1. **Refine** \u2014 If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Use the right question type:
    - open_ended (default) for free-text input
    - multiple_answers when several independent choices are valid
