@@ -563,6 +563,21 @@ function stopWatcher(): void {
 	}
 }
 
+// Extension tools and commands can run while the host agent is processing a
+// turn. Queue injected work as a follow-up so Pi delivers it only after the
+// current run settles instead of trying an unavailable immediate follow-up.
+// Command/template expansion is enabled because callers may intentionally
+// inject an extension command as well as plain workflow context.
+function queueGoalMessage(
+	api: ExtensionAPI,
+	content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+): void {
+	api.sendUserMessage(content, {
+		deliverAs: "followUp",
+		expandPromptTemplates: true,
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Audit runner — spawns the isolated auditor in-process and streams its
 // activity (thinking tokens, tool calls, results) into state.auditLog so the
@@ -1321,7 +1336,7 @@ export default function (pi: ExtensionAPI) {
 				.map((t) => `- ${t.id}: ${t.reason}`)
 				.join("\n");
 
-			pi.sendUserMessage([
+			queueGoalMessage(pi, [
 				{
 					type: "text",
 					text: `The auditor rejected the work. Tasks reset to pending.\n\n**Auditor feedback:** ${params.feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks. When everything passes, call \`goal_complete\` again to re-trigger the audit.`,
@@ -1398,7 +1413,7 @@ export default function (pi: ExtensionAPI) {
 			refreshWidget(ctx as ExtensionContext);
 			ctx.ui.setStatus("pi-goal", "Active");
 
-			pi.sendUserMessage([
+			queueGoalMessage(pi, [
 				{
 					type: "text",
 					text: buildGoalInstructionPrompt(topic),
@@ -1481,7 +1496,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("pi-goal", "Active");
 
 			const incomplete = state.tasks.filter((t) => t.status !== "completed");
-			pi.sendUserMessage(
+			queueGoalMessage(pi,
 				[
 					{
 						type: "text",
