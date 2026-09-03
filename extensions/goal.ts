@@ -165,6 +165,57 @@ function clearState(): void {
 	if (fs.existsSync(p)) fs.unlinkSync(p);
 }
 
+// Tail-truncate a line for narrow widget columns: keep the last maxWidth
+// visible characters (prefixed with "…" when truncated) so the viewer sees
+// the most recent tokens of a growing line (e.g. the auditor's thinking
+// stream) instead of the stale head. A leading "label: " prefix (like
+// "thinking: ") is preserved so the row stays recognizable. ANSI-free by
+// design (styling is applied at merge time).
+function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = "…"): string {
+	if (maxWidth <= 0 || text.length === 0) return "";
+	if (visibleWidth(text) <= maxWidth) return text;
+
+	const ellipsisWidth = visibleWidth(ellipsis);
+	if (ellipsisWidth >= maxWidth) return ellipsis.slice(0, maxWidth);
+
+	// Keep a leading "label: " prefix (e.g. "thinking: ") so the row stays
+	// recognizable even when the line overflows; only the content tail is cut.
+	// The label is kept only if the ellipsis plus at least one content cell fits.
+	let label = "";
+	let content = text;
+	const labelMatch = text.match(/^[^:]{1,12}: /);
+	if (labelMatch) {
+		const candidate = labelMatch[0];
+		if (visibleWidth(candidate) + ellipsisWidth + 1 <= maxWidth) {
+			label = candidate;
+			content = text.slice(label.length);
+		}
+	}
+	const labelWidth = visibleWidth(label);
+	const budget = maxWidth - ellipsisWidth - labelWidth;
+	if (budget <= 0) return label + ellipsis;
+
+	// Fast path: pure printable ASCII content (1 char == 1 cell).
+	if (/^[\x20-\x7e]*$/.test(content)) {
+		return label + ellipsis + content.slice(-budget);
+	}
+
+	// Slow path: wide/emoji content — walk graphemes from the end, keeping
+	// visible width within budget.
+	const segments = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(content)];
+	const kept: string[] = [];
+	let width = 0;
+	for (let i = segments.length - 1; i >= 0; i--) {
+		const seg = segments[i].segment;
+		const w = visibleWidth(seg);
+		if (width + w > budget) break;
+		kept.unshift(seg);
+		width += w;
+	}
+	if (kept.length === 0) return label + ellipsis;
+	return label + ellipsis + kept.join("");
+}
+
 // ---------------------------------------------------------------------------
 // Goal paraphrasing (cheap heuristic for short widget titles)
 // ---------------------------------------------------------------------------
@@ -289,7 +340,14 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 			const maxLines = 15;
 			const start = Math.max(0, log.length - maxLines);
 			for (let i = start; i < log.length; i++) {
-				const trimmed = truncateToWidth(sanitizeLogLine(log[i]), Math.max(1, rightW - 4), "...", false);
+				const raw = sanitizeLogLine(log[i]);
+				const maxW = Math.max(1, rightW - 4);
+				// Thinking lines are a live, ever-growing stream: tail-truncate so
+				// the panel slides to the most recent tokens instead of freezing on
+				// the head. All other lines (tool calls, results) stay head-truncated.
+				const trimmed = raw.startsWith("thinking: ")
+					? tailTruncateToWidth(raw, maxW)
+					: truncateToWidth(raw, maxW, "...", false);
 				rightPlain.push(trimmed);
 			}
 		} else {
