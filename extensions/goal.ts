@@ -753,7 +753,12 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 			status: "completed" as const,
 			auditResult: params.feedback,
 		}));
-		state.auditLog = [...(state.auditLog || []), `PASSED: ${sanitizeLogLine(params.feedback)}`];
+		state.auditLog = [
+			...(state.auditLog || []),
+			"  ok goal_audit_result",
+			"auditor finished",
+			`PASSED: ${sanitizeLogLine(params.feedback)}`,
+		];
 		saveState(state);
 		return { approved: true, failedTaskCount: 0 };
 	}
@@ -772,7 +777,12 @@ function applyAuditVerdict(params: { approved: boolean; feedback: string; failed
 		}
 		return { ...t, status: "completed" as const, auditResult: params.feedback };
 	});
-	state.auditLog = [...(state.auditLog || []), `REJECTED: ${sanitizeLogLine(params.feedback)}`];
+	state.auditLog = [
+		...(state.auditLog || []),
+		"  ok goal_audit_result",
+		"auditor finished",
+		`REJECTED: ${sanitizeLogLine(params.feedback)}`,
+	];
 	for (const ft of params.failedTasks || []) {
 		state.auditLog.push(`  - ${ft.id}: ${sanitizeLogLine(ft.reason)}`);
 	}
@@ -848,9 +858,13 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 		// extension does not re-register its tools or widgets inside the
 		// auditor), no skills, no prompt templates, no context files. The
 		// auditor gets only the read/verify tools plus the verdict tool.
+		// The system prompt is passed directly to the resource loader so it
+		// survives the session.prompt() internal reset to _baseSystemPrompt.
+		const auditorPrompt = buildAuditorSystemPrompt(loadState() || state);
 		const loader = new DefaultResourceLoader({
 			cwd: ctx.cwd,
 			agentDir: getAgentDir(),
+			systemPrompt: auditorPrompt,
 			noExtensions: true,
 			noSkills: true,
 			noPromptTemplates: true,
@@ -865,14 +879,12 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 			resourceLoader: loader,
 			sessionManager: SessionManager.inMemory(),
 			model: ctx.model,
-			thinkingLevel: ctx.thinkingLevel ?? "medium",
+			// Use a low thinking level so the auditor does not burn its
+			// context window on reasoning before calling the verdict tool.
+			thinkingLevel: "low",
 			tools: [...AUDITOR_TOOLS, "goal_audit_result"],
 			customTools: [auditVerdictTool],
 		});
-
-		// A fresh, bounded context: no goal tools other than the verdict
-		// submitter we inject here.
-		session.agent.state.systemPrompt = buildAuditorSystemPrompt(loadState() || state);
 
 		// Stream the auditor's activity into the audit log.
 		let thinkingBuf = "";
@@ -922,7 +934,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 
 		try {
 			await session.prompt(
-				"Audit the goal now. Read .pi/goal/state.json first, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
+				"Read .pi/goal/state.json, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
 			);
 
 			// The auditor can finish its turn without submitting a verdict
