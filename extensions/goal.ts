@@ -166,12 +166,12 @@ function clearState(): void {
 }
 
 // Tail-truncate a line for narrow widget columns: keep the last maxWidth
-// visible characters (prefixed with "…" when truncated) so the viewer sees
+// visible characters so the viewer sees
 // the most recent tokens of a growing line (e.g. the auditor's thinking
 // stream) instead of the stale head. A leading "label: " prefix (like
 // "thinking: ") is preserved so the row stays recognizable. ANSI-free by
 // design (styling is applied at merge time).
-function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = "…"): string {
+function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = ""): string {
 	if (maxWidth <= 0 || text.length === 0) return "";
 	if (visibleWidth(text) <= maxWidth) return text;
 
