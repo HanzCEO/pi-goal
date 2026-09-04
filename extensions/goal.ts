@@ -44,6 +44,11 @@ import { Container, ScrollView, Text, visibleWidth, truncateToWidth } from "@ear
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
+// Inter-extension beep channel. pi-beep subscribes to this on pi.events; the
+// emit is a silent no-op when pi-beep is not loaded. Matches the BEEP_EVENT
+// export in pi-beep's service module.
+const BEEP_EVENT = "beep:notify";
+
 const buildGoalInstructionPrompt = (topic: string): string =>
 	`I want to accomplish this goal: ${topic}
 
@@ -176,6 +181,20 @@ function isYoloActive(ctx: ExtensionContext): boolean {
 	const state = loadState();
 	if (!state || state.yoloMode !== true) return false;
 	return state.yoloSessionId === ctx.sessionManager.getSessionId();
+}
+
+// ---------------------------------------------------------------------------
+// Beep integration: page the user when the agent is about to block on input.
+// The emit goes onto pi's shared extension event bus, which pi-beep listens
+// on; when pi-beep is not loaded nothing happens. Only beep when the tool is
+// actually going to block on the user in the terminal: interactive mode and
+// yolo off (yolo auto-answers/auto-approves, so no attention is needed).
+// ---------------------------------------------------------------------------
+let piEvents: ExtensionAPI["events"] | undefined;
+
+function maybeBeep(ctx: ExtensionContext, title: string, body: string): void {
+	if (!piEvents || ctx.mode !== "tui" || isYoloActive(ctx)) return;
+	piEvents.emit(BEEP_EVENT, { title, body });
 }
 
 // Tail-truncate a line for narrow widget columns: keep the last maxWidth
@@ -991,6 +1010,10 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Wire the beep helper to the inter-extension event bus. Set here (not at
+	// module scope) because this is where the ExtensionAPI is first available.
+	piEvents = pi.events;
+
 	// -----------------------------------------------------------------------
 	// Lifecycle: restore widget on session start
 	// -----------------------------------------------------------------------
@@ -1069,6 +1092,7 @@ export default function (pi: ExtensionAPI) {
 				if (isYoloActive(ctx)) {
 					answer = recommended;
 				} else {
+					maybeBeep(ctx, "Goal question", question);
 					const selectOptions = [...displayOptions, CUSTOM_OPTION];
 					const choice = await ctx.ui.select(question, selectOptions);
 					const strippedChoice = choice?.replace(/^\* /, "") ?? null;
@@ -1089,6 +1113,7 @@ export default function (pi: ExtensionAPI) {
 								: "";
 					answer = recommended ? [recommended] : [];
 				} else {
+					maybeBeep(ctx, "Goal question", question);
 					const allOptions = options.length > 0 ? [...options, CUSTOM_OPTION] : [CUSTOM_OPTION];
 					const placeholder = `Comma-separated values. Options: ${allOptions.join(", ")}`;
 					const raw = await ctx.ui.input(question, placeholder);
@@ -1121,6 +1146,7 @@ export default function (pi: ExtensionAPI) {
 						details: { question, type, answer: null, yoloBlocked: true },
 					};
 				}
+				maybeBeep(ctx, "Goal question", question);
 				const raw = await ctx.ui.input(question, "Type your answer and press Enter");
 				answer = raw ?? null;
 			}
@@ -1207,6 +1233,7 @@ export default function (pi: ExtensionAPI) {
 					choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
 					if (choice === undefined) choice = "Yes, proceed";
 				} else {
+					maybeBeep(ctx, "Plan approval needed", paraphraseGoal(params.refinedGoal));
 					choice = await ctx.ui.select("Goal Plan", ["Yes, proceed", "No, revise", "I have a comment"]);
 				}
 			} finally {
