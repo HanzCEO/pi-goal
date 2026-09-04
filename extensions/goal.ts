@@ -40,7 +40,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Container, ScrollView, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, Spacer, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
@@ -297,7 +297,13 @@ function buildTaskWindow(tasks: TaskState[], currentIndex: number, availWidth: n
 // ---------------------------------------------------------------------------
 // Render the widget as plain styled strings (theme + colors applied).
 
-function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | undefined, yoloActive: boolean): string[] {
+function renderWidgetLines(
+	state: GoalState,
+	width: number,
+	rows: number,
+	theme: ThemeLike | undefined,
+	yoloActive: boolean,
+): string[] {
 	const style = theme
 		? makeStyleHelpers(theme)
 		: { bold: (s: string) => s, italic: (s: string) => s, fg: (_c: string, s: string) => s, muted: (s: string) => s };
@@ -312,6 +318,9 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 
 	const title = (state.refinedGoal || state.goal).trim() || "(no goal yet)";
 	const paraphrased = paraphraseGoal(title);
+
+	// Cap widget height to prevent scrolling off terminal screen and causing redraw flickers
+	const maxWidgetLines = Math.max(5, Math.min(8, Math.floor(rows * 0.35)));
 
 	const out: string[] = [];
 
@@ -329,95 +338,44 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 	out.push(style.fg("dim", hr));
 
 	if (state.status === "auditing") {
-		// Left/right split: left column = task list, right column = auditor token stream.
-		// The user sees both at once: what is being checked and what the auditor is saying.
-		const leftW = Math.max(1, Math.min(Math.max(20, Math.floor(innerWidth * 0.38)), innerWidth - 4));
-		const rightW = Math.max(1, innerWidth - leftW - 3);
-		const sep = style.fg("dim", "│");
+		// Compact live audit status (keeps total widget lines <= 6 to prevent scrollback flicker)
+		const verifiedCount = completed + failed;
+		const pct = total > 0 ? Math.round((verifiedCount / total) * 100) : 0;
+		const progressBar = makeProgressBar(verifiedCount, Math.max(1, total), Math.min(24, innerWidth - 30), style);
+		const countLabel = style.fg("muted", `Verified: ${verifiedCount}/${total} `);
+		const pctLabel = style.fg("accent", `${pct}%`);
+		const failBadge = failed > 0 ? style.fg("error", ` (${failed} failed)`) : "";
+		out.push(`  ${countLabel}${progressBar} ${pctLabel}${failBadge}`);
 
-		// ── Left column: task list (plain strings, styled at merge time) ──
-		const leftPlain: string[] = [];
-		leftPlain.push("Tasks");
-		const MAX_TASK_ROWS = 10;
-		for (let i = 0; i < state.tasks.length; i++) {
-			if (i >= MAX_TASK_ROWS) {
-				const remaining = state.tasks.length - MAX_TASK_ROWS;
-				leftPlain.push(` ... and ${remaining} more`);
-				break;
-			}
-			const task = state.tasks[i];
-			let icon: string;
-			let note: string;
-			if (!task.auditResult) {
-				icon = "?";
-				note = "verifying...";
-			} else if (task.status === "completed") {
-				icon = "+";
-				note = "ok";
-			} else {
-				icon = "x";
-				note = "FAIL";
-			}
-			const maxDesc = leftW - 12;
-			const desc = truncateToWidth(task.description, maxDesc - 4, "...", true);
-			leftPlain.push(` ${icon} ${desc} ${note}`);
-		}
-
-		// ── Right column: auditor token stream (plain strings, styled at merge) ──
-		const rightPlain: string[] = [];
-		rightPlain.push("Auditor");
-		const log = state.auditLog || [];
-
-		if (log.length > 0) {
-			const maxLines = 15;
-			const start = Math.max(0, log.length - maxLines);
-			for (let i = start; i < log.length; i++) {
-				const raw = sanitizeLogLine(log[i]);
-				const maxW = Math.max(1, rightW - 4);
-				// Thinking lines are a live, ever-growing stream: tail-truncate so
-				// the panel slides to the most recent tokens instead of freezing on
-				// the head. All other lines (tool calls, results) stay head-truncated.
-				const trimmed = raw.startsWith("thinking: ")
-					? tailTruncateToWidth(raw, maxW)
-					: truncateToWidth(raw, maxW, "...", false);
-				rightPlain.push(trimmed);
-			}
+		// Active task being verified
+		const activeTask = state.tasks.find((t) => !t.auditResult);
+		if (activeTask) {
+			const taskPrefix = style.bold(style.fg("warning", "Checking:"));
+			const maxDesc = Math.max(10, innerWidth - visibleWidth(taskPrefix) - 12);
+			const desc = truncateToWidth(activeTask.description, maxDesc, "...", false);
+			out.push(`  ${taskPrefix} [${activeTask.id}] ${desc}`);
+		} else if (state.auditFeedback && state.auditFeedback !== "auditor pending...") {
+			const verdictLabel = style.bold(style.fg("accent", "Verdict:"));
+			const maxVerdict = Math.max(10, innerWidth - visibleWidth(verdictLabel) - 6);
+			const verdictText = truncateToWidth(state.auditFeedback, maxVerdict, "...", false);
+			out.push(`  ${verdictLabel} ${verdictText}`);
 		} else {
-			const pending = !state.auditFeedback || state.auditFeedback === "auditor pending...";
-			if (pending) {
-				rightPlain.push("auditor pending...");
-				rightPlain.push("waiting for host to spawn");
-			} else {
-				rightPlain.push(state.auditFeedback!);
-			}
+			out.push(`  ${style.fg("dim", "Auditor is concluding verification...")}`);
 		}
 
-		// ── Merge columns with visible-width padding ──
-		const maxRows = Math.max(leftPlain.length, rightPlain.length);
-		// Left header + task rows get fg("text") styling; right header is dim, rest are text.
-		for (let i = 0; i < maxRows; i++) {
-			const lRaw = i < leftPlain.length ? leftPlain[i] : "";
-			const lVis = visibleWidth(lRaw);
-			const lPad = lVis < leftW ? " ".repeat(leftW - lVis) : "";
-			const lFinal =
-				i === 0
-					? style.fg("muted", lRaw + lPad)
-					: lRaw.trimStart().startsWith("+")
-						? style.fg("text", " " + style.fg("success", "+") + lRaw.slice(2) + lPad)
-						: lRaw.trimStart().startsWith("x")
-							? style.fg("text", " " + style.fg("error", "x") + lRaw.slice(2) + lPad)
-							: style.fg("text", lRaw + lPad);
-
-			const rRaw = i < rightPlain.length ? rightPlain[i] : "";
-			const rFinal = i === 0 ? style.fg("dim", ` ${rRaw}`) : rRaw ? ` ${style.fg("text", rRaw)}` : "";
-
-			out.push(` ${lFinal} ${sep}${rFinal}`);
-		}
-
-		// Verdict footer when audit is done
-		if (state.auditFeedback && state.auditFeedback !== "auditor pending..." && log.length > 0) {
-			const trimmed = truncateToWidth(state.auditFeedback, innerWidth - 10, "...", false);
-			out.push(` ${style.bold(style.fg("warning", "Verdict:"))} ${style.fg("text", trimmed)}`);
+		// Latest log line or streaming thinking delta
+		const log = state.auditLog || [];
+		if (log.length > 0) {
+			const lastRaw = sanitizeLogLine(log[log.length - 1]);
+			const isThinking = lastRaw.startsWith("thinking: ");
+			const maxW = Math.max(10, innerWidth - 6);
+			const displayLog = isThinking
+				? tailTruncateToWidth(lastRaw, maxW)
+				: truncateToWidth(lastRaw, maxW, "...", false);
+			const styledLog = isThinking ? style.fg("dim", displayLog) : style.fg("muted", displayLog);
+			out.push(`  ${styledLog}`);
+		} else {
+			out.push(`  ${style.fg("dim", "Waiting for auditor output...")}`);
 		}
 
 		out.push(style.fg("dim", hr));
@@ -434,9 +392,10 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 		out.push(`${progressLabel}${progressBar}  ${percentLabel}${failedLabel}`);
 	}
 
-	// Task window: t-1, t, t+1, t+2
+	// Task window: dynamic line budget based on terminal rows (leaves room for header, progress, divider)
+	const taskLinesBudget = Math.max(1, maxWidgetLines - 4);
 	if (total > 0) {
-		const window = buildTaskWindow(state.tasks, currentIndex, innerWidth, 4);
+		const window = buildTaskWindow(state.tasks, currentIndex, innerWidth, taskLinesBudget);
 		for (const line of window.split("\n")) {
 			const styled = styleTaskLine(line, style, currentIndex);
 			out.push(`  ${styled}`);
@@ -519,52 +478,57 @@ function styleTaskLine(line: string, style: ReturnType<typeof makeStyleHelpers>,
 
 
 // ---------------------------------------------------------------------------
-// Plan widget: full task plan in a scrollable view (approval dialog companion)
+// Plan formatting: full task plan emitted to chat transcript
 // ---------------------------------------------------------------------------
 
-// The stock ctx.ui.confirm renders the message as a non-scrollable title in a
-// selector with only Yes/No options, so long plans get clipped and the user
-// cannot scroll up to read them. Instead we render the full plan into a
-// ScrollView widget above the editor (wheel-scrollable) and keep the confirm
-// dialog itself short.
-
-const PLAN_WIDGET_KEY = "pi-goal-plan";
-
-function buildPlanLines(params: { refinedGoal: string; tasks: { id: string; description: string; contract: string; acceptanceCriteria: string[] }[] }): string[] {
-	const lines: string[] = [];
-	lines.push("Refined Goal:");
-	lines.push(`  ${params.refinedGoal}`);
-	lines.push("");
-	lines.push(`Tasks (${params.tasks.length}):`);
+function formatPlanMarkdown(params: {
+	refinedGoal: string;
+	tasks: { id: string; description: string; contract: string; acceptanceCriteria: string[] }[];
+}): string {
+	const sections: string[] = [];
+	sections.push(`## Refined Goal\n${params.refinedGoal}`);
+	sections.push(`### Planned Tasks (${params.tasks.length})`);
 	for (let i = 0; i < params.tasks.length; i++) {
 		const t = params.tasks[i];
-		lines.push("");
-		lines.push(`${i + 1}. ${t.description}  [${t.id}]`);
-		lines.push(`   Contract: ${t.contract}`);
-		lines.push(`   Verify: ${t.acceptanceCriteria.join("; ")}`);
+		const criteria = t.acceptanceCriteria.map((c) => `  * ${c}`).join("\n");
+		sections.push(
+			`**${i + 1}. ${t.description}** \`[${t.id}]\`\n` +
+			`* **Contract:** ${t.contract}\n` +
+			`* **Acceptance Criteria:**\n${criteria}`,
+		);
 	}
-	return lines;
+	return sections.join("\n\n");
 }
 
-function setPlanWidget(ctx: ExtensionContext, lines: string[]): void {
-	const container = new Container();
-	for (const line of lines) {
-		container.addChild(new Text(line, 1, 0));
-	}
-	const scroll = new ScrollView(container, {
-		axis: "vertical",
-		follow: "none",
-		overscroll: "chain",
-		scrollbar: "auto",
-	});
-	// The factory form is required to hand the host a component. The host
-	// invokes the factory once and keeps the returned component, so we can
-	// return the same ScrollView instance (its scroll state is preserved).
-	ctx.ui.setWidget(PLAN_WIDGET_KEY, () => scroll);
-}
+function formatAuditReportMarkdown(
+	state: GoalState | null,
+	approved: boolean,
+	feedback: string,
+	failedTasks?: TaskState[],
+): string {
+	const sections: string[] = [];
+	const statusBadge = approved ? "**STATUS: PASSED**" : "**STATUS: REJECTED**";
+	sections.push(`## ${statusBadge}\n\n**Auditor Feedback:**\n${feedback}`);
 
-function clearPlanWidget(ctx: ExtensionContext): void {
-	ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
+	if (state && state.tasks.length > 0) {
+		sections.push(`### Task Verification Summary`);
+		for (let i = 0; i < state.tasks.length; i++) {
+			const t = state.tasks[i];
+			const isDone = t.status === "completed";
+			const icon = isDone ? "[PASS]" : "[FAIL]";
+			const reason = t.auditResult || t.error || (isDone ? "Verified against acceptance criteria" : "Criteria not met");
+			sections.push(`* **${icon} Task ${i + 1} (${t.id}):** ${t.description}\n  * Detail: ${reason}`);
+		}
+	}
+
+	if (!approved && failedTasks && failedTasks.length > 0) {
+		sections.push(`### Tasks Requiring Rework`);
+		for (const ft of failedTasks) {
+			sections.push(`* **${ft.id}:** ${ft.description}\n  * Reason: ${ft.error || ft.auditResult || feedback}`);
+		}
+	}
+
+	return sections.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -595,8 +559,10 @@ function refreshWidget(ctx: ExtensionContext): void {
 	}
 	const yoloActive = isYoloActive(ctx);
 	ctx.ui.setWidget("pi-goal", (tui, theme) => {
-		const width = (tui as { terminal?: { columns?: number } }).terminal?.columns ?? 80;
-		const lines = renderWidgetLines(state, width, theme as unknown as ThemeLike | undefined, yoloActive);
+		const term = (tui as { terminal?: { columns?: number; rows?: number } }).terminal;
+		const width = term?.columns ?? 80;
+		const rows = term?.rows ?? 24;
+		const lines = renderWidgetLines(state, width, rows, theme as unknown as ThemeLike | undefined, yoloActive);
 
 		if (widgetCache) {
 			const { container, texts } = widgetCache;
@@ -1015,6 +981,56 @@ export default function (pi: ExtensionAPI) {
 	piEvents = pi.events;
 
 	// -----------------------------------------------------------------------
+	// Custom message renderers
+	// -----------------------------------------------------------------------
+
+	pi.registerMessageRenderer("goal_plan", (message, _options, theme) => {
+		const container = new Container();
+		container.addChild(new Spacer(1));
+		const header = theme.bold(theme.fg("accent", "Proposed Goal Plan"));
+		container.addChild(new Text(header, 1, 0));
+		container.addChild(new Spacer(1));
+
+		let text = "";
+		if (typeof message.content === "string") {
+			text = message.content;
+		} else if (Array.isArray(message.content)) {
+			text = message.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+		}
+		container.addChild(new Markdown(text, 1, 0));
+		container.addChild(new Spacer(1));
+		return container;
+	});
+
+	pi.registerMessageRenderer("goal_audit_report", (message, _options, theme) => {
+		const container = new Container();
+		container.addChild(new Spacer(1));
+		const details = (message.details ?? {}) as { approved?: boolean };
+		const isApproved = details.approved === true;
+		const titleColor = isApproved ? "success" : "warning";
+		const titleText = isApproved ? "Goal Audit Report (PASSED)" : "Goal Audit Report (REJECTED)";
+		const header = theme.bold(theme.fg(titleColor, titleText));
+		container.addChild(new Text(header, 1, 0));
+		container.addChild(new Spacer(1));
+
+		let text = "";
+		if (typeof message.content === "string") {
+			text = message.content;
+		} else if (Array.isArray(message.content)) {
+			text = message.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+		}
+		container.addChild(new Markdown(text, 1, 0));
+		container.addChild(new Spacer(1));
+		return container;
+	});
+
+	// -----------------------------------------------------------------------
 	// Lifecycle: restore widget on session start
 	// -----------------------------------------------------------------------
 
@@ -1219,25 +1235,24 @@ export default function (pi: ExtensionAPI) {
 			saveState(state);
 			refreshWidget(ctx as ExtensionContext);
 
-			const planLines = buildPlanLines(params);
-
-			// Render the full plan into a scrollable widget above the editor.
-			// The stock confirm dialog cannot scroll its message, so the user
-			// would only ever see the first screenful of the plan.
-			setPlanWidget(ctx as ExtensionContext, planLines);
+			// Emit the full, untruncated plan to the chat transcript.
+			// The user can scroll up in their terminal window to review it without flicker.
+			const planMarkdown = formatPlanMarkdown(params);
+			pi.sendMessage({
+				customType: "goal_plan",
+				content: planMarkdown,
+				display: true,
+				details: { refinedGoal: params.refinedGoal, tasks: params.tasks },
+			});
 
 			let choice: string | undefined;
-			try {
-				if (isYoloActive(ctx)) {
-					// Show plan widget briefly, then auto-confirm after 1.5s
-					choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
-					if (choice === undefined) choice = "Yes, proceed";
-				} else {
-					maybeBeep(ctx, "Plan approval needed", paraphraseGoal(params.refinedGoal));
-					choice = await ctx.ui.select("Goal Plan", ["Yes, proceed", "No, revise", "I have a comment"]);
-				}
-			} finally {
-				clearPlanWidget(ctx as ExtensionContext);
+			if (isYoloActive(ctx)) {
+				// Auto-confirm after 1.5s in YOLO mode
+				choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
+				if (choice === undefined) choice = "Yes, proceed";
+			} else {
+				maybeBeep(ctx, "Plan approval needed", paraphraseGoal(params.refinedGoal));
+				choice = await ctx.ui.select("Approve plan?", ["Yes, proceed", "No, revise", "I have a comment"]);
 			}
 
 			if (choice === "Yes, proceed") {
@@ -1378,6 +1393,17 @@ export default function (pi: ExtensionAPI) {
 				clearWidget(ctx as ExtensionContext);
 				ctx.ui.setStatus("pi-goal", "");
 				ctx.ui.notify(`Goal audited and completed.\n\n${result.feedback}`, "info");
+
+				// Emit the full, untruncated audit report to the chat transcript
+				const finalState = loadState();
+				const reportMarkdown = formatAuditReportMarkdown(finalState, true, result.feedback);
+				pi.sendMessage({
+					customType: "goal_audit_report",
+					content: reportMarkdown,
+					display: true,
+					details: { approved: true, feedback: result.feedback },
+				});
+
 				return {
 					content: [{ type: "text", text: `Audit passed. Goal completed.\n\n${result.feedback}` }],
 					details: { submittedForAudit: true, approved: true, feedback: result.feedback },
@@ -1395,6 +1421,15 @@ export default function (pi: ExtensionAPI) {
 
 			const feedback = result.feedback;
 			const text = `Audit rejected. Tasks reset to pending.\n\n**Auditor feedback:** ${feedback}\n\n**Tasks that need rework:**\n${failedList}\n\nRe-execute only the failing tasks, then call goal_complete again.`;
+
+			// Emit the full, untruncated rejection report to the chat transcript
+			const reportMarkdown = formatAuditReportMarkdown(st, false, feedback, failed);
+			pi.sendMessage({
+				customType: "goal_audit_report",
+				content: reportMarkdown,
+				display: true,
+				details: { approved: false, feedback, failedTasks: failed },
+			});
 
 			return {
 				content: [{ type: "text", text }],
@@ -1438,6 +1473,16 @@ export default function (pi: ExtensionAPI) {
 				clearWidget(ctx);
 				ctx.ui.setStatus("pi-goal", "");
 				ctx.ui.notify(`Goal audited and completed.\n\n${params.feedback}`, "info");
+
+				const finalState = loadState();
+				const reportMarkdown = formatAuditReportMarkdown(finalState, true, params.feedback);
+				pi.sendMessage({
+					customType: "goal_audit_report",
+					content: reportMarkdown,
+					display: true,
+					details: { approved: true, feedback: params.feedback },
+				});
+
 				return {
 					content: [{ type: "text", text: `Auditor approved. Goal completed.\n\n${params.feedback}` }],
 					details: { approved: true },
@@ -1450,6 +1495,16 @@ export default function (pi: ExtensionAPI) {
 			const failedList = (params.failedTasks || [])
 				.map((t) => `- ${t.id}: ${t.reason}`)
 				.join("\n");
+
+			const st = loadState();
+			const failed = (st?.tasks || []).filter((t) => t.status !== "completed");
+			const reportMarkdown = formatAuditReportMarkdown(st, false, params.feedback, failed);
+			pi.sendMessage({
+				customType: "goal_audit_report",
+				content: reportMarkdown,
+				display: true,
+				details: { approved: false, feedback: params.feedback, failedTasks: failed },
+			});
 
 			queueGoalMessage(pi, [
 				{
