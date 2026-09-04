@@ -43,7 +43,6 @@ import { Type } from "typebox";
 import { Container, ScrollView, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
-let yoloMode = false;
 
 const buildGoalInstructionPrompt = (topic: string): string =>
 	`I want to accomplish this goal: ${topic}
@@ -113,6 +112,8 @@ interface GoalState {
 	result: string | null;
 	auditFeedback: string | null;
 	auditLog: string[];
+	yoloMode: boolean;
+	yoloSessionId: string | null;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -163,6 +164,18 @@ function saveState(state: GoalState): void {
 function clearState(): void {
 	const p = getStatePath();
 	if (fs.existsSync(p)) fs.unlinkSync(p);
+}
+
+// Yolo mode is persisted in the goal state so it survives process lifecycles
+// (module reloads, /reload, process restarts within the same directory). It is
+// scoped to the session that enabled it: effective when the recorded
+// yoloSessionId matches the current session id. A different session (e.g. after
+// /new) therefore starts with yolo off, which also fixes the previous
+// module-scope variable leaking yolo across sessions in the same process.
+function isYoloActive(ctx: ExtensionContext): boolean {
+	const state = loadState();
+	if (!state || state.yoloMode !== true) return false;
+	return state.yoloSessionId === ctx.sessionManager.getSessionId();
 }
 
 // Tail-truncate a line for narrow widget columns: keep the last maxWidth
@@ -265,7 +278,7 @@ function buildTaskWindow(tasks: TaskState[], currentIndex: number, availWidth: n
 // ---------------------------------------------------------------------------
 // Render the widget as plain styled strings (theme + colors applied).
 
-function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | undefined): string[] {
+function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | undefined, yoloActive: boolean): string[] {
 	const style = theme
 		? makeStyleHelpers(theme)
 		: { bold: (s: string) => s, italic: (s: string) => s, fg: (_c: string, s: string) => s, muted: (s: string) => s };
@@ -278,14 +291,14 @@ function renderWidgetLines(state: GoalState, width: number, theme: ThemeLike | u
 	const failed = state.tasks.filter((t) => t.status === "failed").length;
 	const currentIndex = state.tasks.findIndex((t) => t.status === "in-progress" || t.status === "approved");
 
-	const title = state.refinedGoal || state.goal;
+	const title = (state.refinedGoal || state.goal).trim() || "(no goal yet)";
 	const paraphrased = paraphraseGoal(title);
 
 	const out: string[] = [];
 
 	// Header row: GOAL (paraphrased)
 	const headerLabel = style.bold(style.fg("accent", "GOAL"));
-	const yoloBadge = yoloMode ? style.bold(style.fg("warning", " YOLO ")) : "";
+	const yoloBadge = yoloActive ? style.bold(style.fg("warning", " YOLO ")) : "";
 	const statusBadge = state.status === "auditing"
 		? style.bold(style.fg("warning", " AUDITING "))
 		: state.status === "paused"
@@ -561,9 +574,10 @@ function refreshWidget(ctx: ExtensionContext): void {
 		clearWidget(ctx);
 		return;
 	}
+	const yoloActive = isYoloActive(ctx);
 	ctx.ui.setWidget("pi-goal", (tui, theme) => {
 		const width = (tui as { terminal?: { columns?: number } }).terminal?.columns ?? 80;
-		const lines = renderWidgetLines(state, width, theme as unknown as ThemeLike | undefined);
+		const lines = renderWidgetLines(state, width, theme as unknown as ThemeLike | undefined, yoloActive);
 
 		if (widgetCache) {
 			const { container, texts } = widgetCache;
@@ -1052,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
 				// marker on index 0 no matter where the model placed the option.
 				const orderedOptions = [recommended, ...options.filter((opt) => opt !== recommended)];
 				const displayOptions = orderedOptions.map((opt) => (opt === recommended ? `* ${opt}` : opt));
-				if (yoloMode) {
+				if (isYoloActive(ctx)) {
 					answer = recommended;
 				} else {
 					const selectOptions = [...displayOptions, CUSTOM_OPTION];
@@ -1066,7 +1080,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			} else if (type === "multiple_answers") {
-				if (yoloMode) {
+				if (isYoloActive(ctx)) {
 					const recommended =
 						params.recommended && options.includes(params.recommended)
 							? params.recommended
@@ -1101,7 +1115,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} else {
 				// open_ended
-				if (yoloMode) {
+				if (isYoloActive(ctx)) {
 					return {
 						content: [{ type: "text", text: "Error: open-ended questions are not available in yolo mode. Use radio_answers or multiple_answers instead." }],
 						details: { question, type, answer: null, yoloBlocked: true },
@@ -1161,6 +1175,8 @@ export default function (pi: ExtensionAPI) {
 				result: null,
 				auditFeedback: null,
 				auditLog: [],
+				yoloMode: false,
+				yoloSessionId: null,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 			};
@@ -1186,7 +1202,7 @@ export default function (pi: ExtensionAPI) {
 
 			let choice: string | undefined;
 			try {
-				if (yoloMode) {
+				if (isYoloActive(ctx)) {
 					// Show plan widget briefly, then auto-confirm after 1.5s
 					choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
 					if (choice === undefined) choice = "Yes, proceed";
@@ -1467,6 +1483,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// Carry yolo state over from a previous goal in this session so it
+			// persists across goals until toggled off or the session changes.
+			const prevState = loadState();
 			const state: GoalState = {
 				goal: topic,
 				refinedGoal: null,
@@ -1475,6 +1494,8 @@ export default function (pi: ExtensionAPI) {
 				result: null,
 				auditFeedback: null,
 				auditLog: [],
+				yoloMode: prevState?.yoloMode ?? false,
+				yoloSessionId: prevState?.yoloSessionId ?? null,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 			};
@@ -1506,6 +1527,7 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				`Goal: ${state.refinedGoal || state.goal}`,
 				`Status: ${state.status}`,
+				`YOLO: ${isYoloActive(ctx) ? "ON" : "OFF"}`,
 				`Tasks: ${state.tasks.length} total`,
 				"",
 				...state.tasks.map((t) => {
@@ -1588,18 +1610,45 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 	});
 
 	pi.registerCommand("goal-yolo", {
-		description: "Toggle yolo mode. When on: open-ended questions are blocked, recommended answers are auto-selected, and goal plans are auto-approved.",
+		description: "Toggle yolo mode (session-scoped). When on: open-ended questions are blocked, recommended answers are auto-selected, and goal plans are auto-approved. Yolo applies only to the session that enabled it; a different session id starts with yolo off.",
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 			if (arg === "on") {
-				yoloMode = true;
-				ctx.ui.notify("YOLO mode ON. Open-ended questions blocked, recommended answers auto-selected, plans auto-approved.", "info");
+				let state = loadState();
+				if (!state) {
+					// No goal yet: persist yolo in a placeholder state so it carries
+					// into the next /goal in this session.
+					state = {
+						goal: "",
+						refinedGoal: null,
+						status: "active" as GoalStatus,
+						tasks: [],
+						result: null,
+						auditFeedback: null,
+						auditLog: [],
+						yoloMode: false,
+						yoloSessionId: null,
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+					};
+				}
+				state.yoloMode = true;
+				state.yoloSessionId = ctx.sessionManager.getSessionId();
+				saveState(state);
+				ctx.ui.notify("YOLO mode ON for this session. Open-ended questions blocked, recommended answers auto-selected, plans auto-approved.", "info");
 			} else if (arg === "off") {
-				yoloMode = false;
+				const state = loadState();
+				if (!state) {
+					ctx.ui.notify("YOLO mode is OFF.", "info");
+					return;
+				}
+				state.yoloMode = false;
+				state.yoloSessionId = null;
+				saveState(state);
 				ctx.ui.notify("YOLO mode OFF.", "info");
 			} else {
-				const status = yoloMode ? "ON" : "OFF";
-				ctx.ui.notify(`YOLO mode is currently ${status}. Use /goal-yolo on or /goal-yolo off to change.`, "info");
+				const status = isYoloActive(ctx) ? "ON" : "OFF";
+				ctx.ui.notify(`YOLO mode is currently ${status} for this session. Use /goal-yolo on or /goal-yolo off to change.`, "info");
 				return;
 			}
 			if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
