@@ -38,7 +38,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, getMarkdownTheme, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Container, Markdown, Spacer, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -1000,7 +1000,7 @@ export default function (pi: ExtensionAPI) {
 				.map((c) => c.text)
 				.join("\n");
 		}
-		container.addChild(new Markdown(text, 1, 0));
+		container.addChild(new Markdown(text, 1, 0, getMarkdownTheme()));
 		container.addChild(new Spacer(1));
 		return container;
 	});
@@ -1025,7 +1025,7 @@ export default function (pi: ExtensionAPI) {
 				.map((c) => c.text)
 				.join("\n");
 		}
-		container.addChild(new Markdown(text, 1, 0));
+		container.addChild(new Markdown(text, 1, 0, getMarkdownTheme()));
 		container.addChild(new Spacer(1));
 		return container;
 	});
