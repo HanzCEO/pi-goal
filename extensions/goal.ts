@@ -1403,7 +1403,7 @@ export default function (pi: ExtensionAPI) {
 				const reportMarkdown = formatAuditReportMarkdown(finalState, true, result.feedback);
 				pi.sendMessage({
 					customType: "goal_audit_report",
-					content: reportMarkdown,
+					content: reportMarkdown + "\n\nDon't forget to git commit conventionally.",
 					display: true,
 					details: { approved: true, feedback: result.feedback },
 				});
