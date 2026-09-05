@@ -1,17 +1,17 @@
 /**
- * pi-goal — Goal-driven agentic workflow extension
+ * pi-goal, a goal-driven agentic workflow extension
  *
  * Invoke with `/goal <topic>`. The command registers the goal and hands
  * control to the agent. The agent refines the goal, plans the work, and
- * executes it — using the provided tools to interact with the user.
+ * executes it using the provided tools to interact with the user.
  *
  * Tools:
- *   goal_ask            — ask the user a clarifying question
- *   goal_approve_plan   — submit a task plan for user approval
- *   goal_update_task    — mark a task in-progress or completed
- *   goal_complete       — submit the goal for audit (requires all tasks done)
- *   goal_audit_result   — submit the auditor's verdict
- *   goal_fail           — mark the goal as failed
+ *   goal_ask            Ask the user a clarifying question
+ *   goal_approve_plan   Submit a task plan for user approval
+ *   goal_update_task    Mark a task in-progress or completed
+ *   goal_complete       Submit the goal for audit (requires all tasks done)
+ *   goal_audit_result   Submit the auditor's verdict
+ *   goal_fail           Mark the goal as failed
  *
  * Widget tracking:
  *   A widget above the editor shows the goal and task progress. It is
@@ -54,26 +54,30 @@ const buildGoalInstructionPrompt = (topic: string): string =>
 
 Work through it step by step:
 
-0. **Explore** \u2014 Before anything, explore and gain enough context about the subject matter. Don't ask the user about the goal, try to explore the codebase first. Only if you have sudden question DO IMMEDIATELY ASK the user. Do not postpone using goal_ask.
+0. **Explore**. Before anything, explore and gain enough context about the subject matter. Don't ask the user about the goal. Try to explore the codebase first. Only if you have a sudden question, DO IMMEDIATELY ASK the user. Do not postpone using goal_ask.
 
-1. **Refine** \u2014 If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Use the right question type:
-   - open_ended (default) for free-text input
-   - multiple_answers when several independent choices are valid
-   - radio_answers when picking a single option from a list (provide the candidate answers via options, putting your recommended one first)
-   Ask ONE question at a time. Do not combine multiple clarifying questions into a single goal_ask call \u2014 each question is asked separately.
+1. **Refine**. If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Choose the right question type with this decision framework:
+
+   - **radio_answers** when the possible answers are a small, enumerable set and the user should pick exactly one. Pass the candidate answers in `options`, putting your recommended answer first. This is the most common type for clarifying questions (e.g., "Which package manager do you use?" with options ["pnpm", "npm", "yarn"]).
+
+   - **multiple_answers** when several independent choices can all be valid simultaneously and the user may want to pick more than one. Pass the candidates in `options` (e.g., "Which features interest you?" with options ["CLI", "GUI", "API", "Plugin"]).
+
+   - **open_ended** when the possible answers are unbounded, unknown, or you need free-form explanation. This is the last resort; prefer radio_answers when you can enumerate the options.
+
+   Ask ONE question at a time. Do not combine multiple clarifying questions into a single goal_ask call. Each question is asked separately.
    Keep asking until you have a clear, actionable goal.
 
-2. **Plan** \u2014 Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
+2. **Plan**. Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
 
-3. **Approve** \u2014 Use goal_approve_plan to submit the refined goal and task list for my approval. If I reject it, revise and resubmit.
+3. **Approve**. Use goal_approve_plan to submit the refined goal and task list for my approval. If I reject it, revise and resubmit.
 
-4. **Execute** \u2014 Once approved, execute each task. Prefer spawning isolated subagents (fresh-context, worktree-isolated) per task so each one has a clean start. After each task, verify it yourself with a fresh, critical eye, then immediately call goal_update_task to mark it "completed". Do not move on to the next task before marking the current one done.
+4. **Execute**. Once approved, execute each task. Prefer spawning isolated subagents (fresh-context, worktree-isolated) per task so each one has a clean start. After each task, verify it yourself with a fresh, critical eye, then immediately call goal_update_task to mark it "completed". Do not move on to the next task before marking the current one done.
 
-5. **Mark done** \u2014 After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate \u2014 mark it done right after verification.
+5. **Mark done**. After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate. Mark it done right after verification.
 
-6. **Complete** \u2014 When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
+6. **Complete**. When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
 
-7. **Audit result** \u2014 goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict; you do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
+7. **Audit result**. goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict. You do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
 
 The state file at .pi/goal/state.json is updated automatically. You can read it to track progress.`;
 
@@ -232,7 +236,7 @@ function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = ""): str
 		return label + ellipsis + content.slice(-budget);
 	}
 
-	// Slow path: wide/emoji content — walk graphemes from the end, keeping
+	// Slow path for wide/emoji content: walk graphemes from the end, keeping
 	// visible width within budget.
 	const segments = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(content)];
 	const kept: string[] = [];
@@ -254,7 +258,7 @@ function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = ""): str
 
 function paraphraseGoal(goal: string): string {
 	const trimmed = goal.trim().replace(/\s+/g, " ");
-	// Take the first sentence as a paraphrase — no hard character cap.
+	// Take the first sentence as a paraphrase; no hard character cap.
 	const firstStop = trimmed.search(/[.!?]/);
 	if (firstStop > 0) return trimmed.slice(0, firstStop + 1);
 	return trimmed;
@@ -638,7 +642,7 @@ function queueGoalMessage(
 }
 
 // ---------------------------------------------------------------------------
-// Audit runner — spawns the isolated auditor in-process and streams its
+// Audit runner. Spawns the isolated auditor in-process and streams its
 // activity (thinking tokens, tool calls, results) into state.auditLog so the
 // widget panel updates live while the audit runs.
 // ---------------------------------------------------------------------------
@@ -954,7 +958,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 			if (st && st.status === "active") {
 				// Rejected: hand the failing tasks back to the main agent.
 				// goal_complete.execute() returns the verdict to the agent directly
-				// via the tool result — no follow-up message needed.
+				// via the tool result; no follow-up message needed.
 				return { approved: false, feedback: st.auditFeedback || "No feedback provided" };
 			} else if (st && st.status === "completed") {
 				return { approved: true, feedback: st.auditFeedback || "All criteria met" };
@@ -1053,7 +1057,7 @@ export default function (pi: ExtensionAPI) {
 		name: "goal_ask",
 		label: "Ask about goal",
 		description:
-			"Ask the user a clarifying question. Use open_ended for free-text input, multiple_answers for comma-separated values, or radio_answers for a single choice from options. Options lists automatically include \"Others (custom answer)\" as an escape hatch. The recommended option for radio_answers (the \"recommended\" param, or the first option when omitted) is moved to the front, marked with a \"*\" prefix, and pre-selected as the default in the UI.",
+			"Ask the user a clarifying question. Choose the question type with this decision framework: radio_answers when the user picks exactly one from a small enumerable set (provide options), multiple_answers when several independent choices are all valid, open_ended when the answers are unbounded or unknown. Options lists automatically include \"Others (custom answer)\" as an escape hatch. The recommended option for radio_answers (the \"recommended\" param, or the first option when omitted) is moved to the front, marked with a \"*\" prefix, and pre-selected as the default in the UI.",
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask the user" }),
 			type: Type.Optional(
@@ -1287,7 +1291,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Update task status",
 		description:
 			"Mark a task as in-progress or completed. The widget updates immediately. " +
-			"Call this right after you finish a task — do not procrastinate.",
+			"Call this right after you finish a task. Do not procrastinate.",
 		parameters: Type.Object({
 			taskId: Type.String({ description: "The task id to update" }),
 			status: Type.Union([Type.Literal("in-progress"), Type.Literal("completed")], {
@@ -1411,7 +1415,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Rejected: hand the failing tasks back to the main agent.
-			// The tool return value carries the full verdict to the agent — no
+			// The tool return value carries the full verdict to the agent. No
 			// separate follow-up needed now that the tool call is already closed.
 			const st = loadState();
 			const failed = (st?.tasks || []).filter((t) => t.status !== "completed");
@@ -1620,7 +1624,7 @@ export default function (pi: ExtensionAPI) {
 						completed: "+",
 						failed: "x",
 					};
-					return `  ${icons[t.status] || "o"} ${t.description} — ${t.status}`;
+					return `  ${icons[t.status] || "o"} ${t.description} (${t.status})`;
 				}),
 			];
 
