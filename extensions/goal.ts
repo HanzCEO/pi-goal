@@ -1237,8 +1237,7 @@ export default function (pi: ExtensionAPI) {
 			state.status = "active";
 			state.auditFeedback = null;
 			saveState(state);
-			refreshWidget(ctx as ExtensionContext);
-
+			
 			// Emit the full, untruncated plan to the chat transcript.
 			// The user can scroll up in their terminal window to review it without flicker.
 			const planMarkdown = formatPlanMarkdown(params);
@@ -1248,6 +1247,8 @@ export default function (pi: ExtensionAPI) {
 				display: true,
 				details: { refinedGoal: params.refinedGoal, tasks: params.tasks },
 			});
+
+			refreshWidget(ctx as ExtensionContext);
 
 			let choice: string | undefined;
 			if (isYoloActive(ctx)) {
