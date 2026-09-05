@@ -58,9 +58,9 @@ Work through it step by step:
 
 1. **Refine**. If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Choose the right question type with this decision framework:
 
-   - **radio_answers** when the possible answers are a small, enumerable set and the user should pick exactly one. Pass the candidate answers in `options`, putting your recommended answer first. This is the most common type for clarifying questions (e.g., "Which package manager do you use?" with options ["pnpm", "npm", "yarn"]).
+   - **radio_answers** when the possible answers are a small, enumerable set and the user should pick exactly one. Pass the candidate answers in \`options\`, putting your recommended answer first. This is the most common type for clarifying questions (e.g., "Which package manager do you use?" with options ["pnpm", "npm", "yarn"]).
 
-   - **multiple_answers** when several independent choices can all be valid simultaneously and the user may want to pick more than one. Pass the candidates in `options` (e.g., "Which features interest you?" with options ["CLI", "GUI", "API", "Plugin"]).
+   - **multiple_answers** when several independent choices can all be valid simultaneously and the user may want to pick more than one. Pass the candidates in \`options\` (e.g., "Which features interest you?" with options ["CLI", "GUI", "API", "Plugin"]).
 
    - **open_ended** when the possible answers are unbounded, unknown, or you need free-form explanation. This is the last resort; prefer radio_answers when you can enumerate the options.
 
