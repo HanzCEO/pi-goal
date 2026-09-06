@@ -649,6 +649,34 @@ function queueGoalMessage(
 
 const AUDITOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+// Collect the local AGENTS.md context files visible from the goal project's
+// cwd, mirroring pi's own context-file discovery but restricted to the exact
+// literal filename "AGENTS.md" (no CLAUDE.md, no AGENTS.override.md variants)
+// and without pi's project-trust gating. Walks from cwd up to the filesystem
+// root, dedupes by canonical path, and returns files root-first (outermost
+// ancestor first, cwd last), matching pi's concatenation order. Each entry
+// holds the file's path and its utf-8 content with any BOM stripped.
+function findProjectAGENTS(cwd: string): Array<{ path: string; content: string }> {
+	const found: Array<{ path: string; content: string }> = [];
+	const seen = new Set<string>();
+	let dir = cwd;
+	while (true) {
+		const filePath = path.join(dir, "AGENTS.md");
+		if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+			const canonical = fs.realpathSync(filePath);
+			if (!seen.has(canonical)) {
+				seen.add(canonical);
+				const content = fs.readFileSync(filePath, "utf-8");
+				found.push({ path: filePath, content: content.startsWith("\uFEFF") ? content.slice(1) : content });
+			}
+		}
+		const parentDir = path.dirname(dir);
+		if (parentDir === dir) break;
+		dir = parentDir;
+	}
+	return found.reverse();
+}
+
 let auditInFlight: Promise<{ approved: boolean; feedback: string } | null> | null = null;
 let auditFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -827,17 +855,26 @@ function summarizeResult(result: unknown): string {
 	return "";
 }
 
-function buildAuditorSystemPrompt(state: GoalState): string {
+function buildAuditorSystemPrompt(state: GoalState, projectCwd: string): string {
 	const tasks = state.tasks
 		.map((t, i) => {
 			const criteria = t.acceptanceCriteria.map((c) => `      - ${c}`).join("\n");
 			return `  ${i + 1}. ${t.id}: ${t.description}\n     contract: ${t.contract}\n     acceptance criteria:\n${criteria}`;
 		})
 		.join("\n\n");
-	return AUDITOR_SYSTEM_PROMPT_TEMPLATE
+	const prompt = AUDITOR_SYSTEM_PROMPT_TEMPLATE
 		.replace("__GOAL__", state.refinedGoal || state.goal)
 		.replace("__RESULT__", state.result || "(none provided)")
 		.replace("__TASKS__", tasks);
+
+	// Fold the project's local AGENTS.md files into the auditor system prompt
+	// as a single trailing section. The auditor session is fully isolated
+	// (noContextFiles: true), so the content must travel inside this prompt
+	// string; there is nothing to append when no AGENTS.md exists.
+	const agentsFiles = findProjectAGENTS(projectCwd);
+	if (agentsFiles.length === 0) return prompt;
+	const content = agentsFiles.map((f) => f.content.trimEnd()).join("\n\n");
+	return `${prompt}\n\n<system>\n${content}\n</system>`;
 }
 
 function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved: boolean; feedback: string } | null> {
@@ -863,7 +900,7 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 		// auditor gets only the read/verify tools plus the verdict tool.
 		// The system prompt is passed directly to the resource loader so it
 		// survives the session.prompt() internal reset to _baseSystemPrompt.
-		const auditorPrompt = buildAuditorSystemPrompt(loadState() || state);
+		const auditorPrompt = buildAuditorSystemPrompt(loadState() || state, ctx.cwd);
 		const loader = new DefaultResourceLoader({
 			cwd: ctx.cwd,
 			agentDir: getAgentDir(),
