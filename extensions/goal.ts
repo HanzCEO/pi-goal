@@ -38,9 +38,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, getMarkdownTheme, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, getMarkdownTheme, getSelectListTheme, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Box, Container, Markdown, Spacer, Text, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, Spacer, Text, SelectList, type Component, type SelectItem, getKeybindings, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_OPTION = "Others (custom answer)";
 
@@ -533,6 +533,166 @@ function formatAuditReportMarkdown(
 	}
 
 	return sections.join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Plan approval dialog
+// The plan must be visible to the user BEFORE they answer the approval prompt.
+// pi.sendMessage() during a streaming turn only queues the message into the
+// agent's steering queue; it does not render to the transcript until the turn
+// settles, which is after this tool has already returned (and after the old
+// select dialog would have been answered). So instead of relying on the
+// transcript, the approval dialog embeds the FULL plan (scrollable) alongside
+// the approval options, plus a custom message is still emitted to the transcript
+// for session history and later reference.
+// ---------------------------------------------------------------------------
+
+const APPROVAL_OPTIONS: SelectItem[] = [
+	{ value: "Yes, proceed", label: "Yes, proceed", description: "Approve the plan and start executing" },
+	{ value: "No, revise", label: "No, revise", description: "Reject it and ask for a revised plan" },
+	{ value: "I have a comment", label: "I have a comment", description: "Send feedback, then the plan is revised" },
+];
+
+/**
+ * Modal overlay component: full plan in a scrollable pane on top, the approval
+ * options underneath. Rendering is bounded to the terminal: the plan pane shows
+ * exactly viewportRows lines, so the overlay never exceeds the terminal and the
+ * TUI's maxHeight clipping never eats the options or the hint line.
+ */
+class PlanApprovalDialog implements Component {
+	private readonly planLines: string[];
+	private readonly viewportRows: number;
+	private readonly showHint: boolean;
+	private readonly selectList: SelectList;
+	private readonly style: ThemeLike;
+	private scrollTop = 0;
+	readonly width: number;
+	readonly expectedHeight: number;
+
+	constructor(
+		planMarkdown: string,
+		termCols: number,
+		termRows: number,
+		style: ThemeLike,
+		done: (result: string | null) => void,
+	) {
+		this.style = style;
+		this.width = Math.max(48, Math.min(termCols - 2, Math.round(termCols * 0.9)));
+		// The TUI clamps an overlay's maxHeight to termRows - 4 (margin 2 top and
+		// bottom). Budget the plan viewport so the dialog's total line count can
+		// never exceed that hard cap. Fixed chrome is title + separator above and
+		// separator + 3 option rows below = 6 rows, plus 1 row reserved for the
+		// scroll indicator and (when there is room) 1 row for the hint. The plan
+		// pane shrinks first, so the option list is always visible; on terminals
+		// too short for the hint it is dropped rather than clipped.
+		const available = Math.max(6, termRows - 4);
+		this.showHint = available >= 9;
+		const chrome = 6 + (this.showHint ? 1 : 0);
+		this.viewportRows = Math.max(1, Math.min(18, available - chrome - 1));
+		this.selectList = new SelectList(APPROVAL_OPTIONS, APPROVAL_OPTIONS.length, getSelectListTheme());
+		this.selectList.onSelect = (item) => done(item.value);
+		this.selectList.onCancel = () => done(null);
+		this.planLines = new Markdown(planMarkdown, 1, 0, getMarkdownTheme()).render(this.width);
+		// Exact rendered height, never above the TUI's maxHeight clamp:
+		// chrome + plan viewport + scroll indicator (only when the plan overflows).
+		this.expectedHeight = chrome + this.viewportRows + (this.planLines.length > this.viewportRows ? 1 : 0);
+	}
+
+	private get maxScroll(): number {
+		return Math.max(0, this.planLines.length - this.viewportRows);
+	}
+
+	private get step(): number {
+		return Math.max(3, Math.floor(this.viewportRows * 0.6));
+	}
+
+	handleInput(data: string): void {
+		if (this.maxScroll > 0) {
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.pageUp")) {
+				this.scrollTop = Math.max(0, this.scrollTop - this.step);
+				return;
+			}
+			if (kb.matches(data, "tui.select.pageDown")) {
+				this.scrollTop = Math.min(this.maxScroll, this.scrollTop + this.step);
+				return;
+			}
+		}
+		this.selectList.handleInput(data);
+	}
+
+	invalidate(): void {
+		// SelectList and Markdown manage their own caches; nothing else to clear.
+	}
+
+	render(width: number): string[] {
+		const style = this.style;
+		const inner = Math.min(this.width, Math.max(20, width));
+		const pad = (s: string): string => {
+			const w = visibleWidth(s);
+			return w >= inner ? s : s + " ".repeat(inner - w);
+		};
+		const hr = style.fg("border", "─".repeat(inner));
+
+		const out: string[] = [];
+		out.push(pad(style.bold(style.fg("accent", " Proposed Goal Plan"))));
+		out.push(pad(hr));
+
+		const start = this.scrollTop;
+		for (let i = start; i < start + this.viewportRows && i < this.planLines.length; i++) {
+			out.push(pad(this.planLines[i]));
+		}
+		if (this.planLines.length > this.viewportRows) {
+			const end = Math.min(this.planLines.length, start + this.viewportRows);
+			out.push(pad(style.fg("muted", `  (${start + 1}-${end} of ${this.planLines.length} lines · PgUp/PgDn scroll)`)));
+		}
+
+		out.push(pad(hr));
+		for (const line of this.selectList.render(inner)) {
+			out.push(pad(line));
+		}
+		if (this.showHint) {
+			out.push(pad(style.fg("dim", "  ↑↓ choose · PgUp/PgDn scroll plan · Enter select · Esc cancel")));
+		}
+		return out;
+	}
+}
+
+/**
+ * Show the plan approval prompt. Non-yolo: a full-plan overlay dialog. Yolo:
+ * the previous auto-approve select with a short timeout. Returns the chosen
+ * option label, or undefined when cancelled.
+ */
+async function showPlanApproval(
+	ctx: ExtensionContext,
+	planMarkdown: string,
+	yoloActive: boolean,
+): Promise<string | undefined> {
+	if (yoloActive) {
+		const choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
+		return choice === undefined ? "Yes, proceed" : choice;
+	}
+
+	let component: PlanApprovalDialog | undefined;
+	const choice = await ctx.ui.custom<string | null>(
+		(tui, theme, _keybindings, done) => {
+			const term = (tui as { terminal?: { columns?: number; rows?: number } }).terminal;
+			const cols = term?.columns ?? 80;
+			const rows = term?.rows ?? 24;
+			component = new PlanApprovalDialog(planMarkdown, cols, rows, theme as unknown as ThemeLike, done);
+			return component;
+		},
+		{
+			overlay: true,
+			overlayOptions: () => ({
+				width: component?.width,
+				maxHeight: component?.expectedHeight,
+				anchor: "center",
+				margin: 2,
+			}),
+		},
+	);
+	return choice ?? undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1386,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "goal_approve_plan",
 		label: "Approve goal plan",
-		description: "Submit a task plan for user approval. The user reviews the refined goal and task list, then approves or rejects.",
+		description:
+			"Submit a task plan for user approval. The user reviews the refined goal and the full details of every task (description, contract, acceptance criteria) in an approval dialog, then approves or rejects. Do not call this together with any other tool in the same message; it blocks until the user answers.",
 		parameters: Type.Object({
 			refinedGoal: Type.String({ description: "The refined goal after clarification" }),
 			tasks: Type.Array(
@@ -1275,8 +1436,9 @@ export default function (pi: ExtensionAPI) {
 			state.auditFeedback = null;
 			saveState(state);
 			
-			// Emit the full, untruncated plan to the chat transcript.
-			// The user can scroll up in their terminal window to review it without flicker.
+			// Emit the full, untruncated plan to the chat transcript for session
+			// history (the approval dialog below already shows the full plan, so
+			// the user reviews it there while this tool is still running).
 			const planMarkdown = formatPlanMarkdown(params);
 			pi.sendMessage({
 				customType: "goal_plan",
@@ -1288,14 +1450,11 @@ export default function (pi: ExtensionAPI) {
 			refreshWidget(ctx as ExtensionContext);
 
 			let choice: string | undefined;
-			if (isYoloActive(ctx)) {
-				// Auto-confirm after 1.5s in YOLO mode
-				choice = await ctx.ui.select("Goal Plan (auto-approving...)", ["Yes, proceed"], { timeout: 1500 });
-				if (choice === undefined) choice = "Yes, proceed";
-			} else {
+			const yoloActive = isYoloActive(ctx);
+			if (!yoloActive) {
 				maybeBeep(ctx, "Plan approval needed", paraphraseGoal(params.refinedGoal));
-				choice = await ctx.ui.select("Approve plan?", ["Yes, proceed", "No, revise", "I have a comment"]);
 			}
+			choice = await showPlanApproval(ctx as ExtensionContext, planMarkdown, yoloActive);
 
 			if (choice === "Yes, proceed") {
 				state.tasks = state.tasks.map((t) => ({ ...t, status: "approved" as const }));
