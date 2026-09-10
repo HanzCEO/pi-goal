@@ -588,7 +588,7 @@ class PlanApprovalDialog implements Component {
 		const available = Math.max(6, termRows - 4);
 		this.showHint = available >= 9;
 		const chrome = 6 + (this.showHint ? 1 : 0);
-		this.viewportRows = Math.max(1, Math.min(18, available - chrome - 1));
+		this.viewportRows = Math.max(1, Math.min(42, available - chrome - 1));
 		this.selectList = new SelectList(APPROVAL_OPTIONS, APPROVAL_OPTIONS.length, getSelectListTheme());
 		this.selectList.onSelect = (item) => done(item.value);
 		this.selectList.onCancel = () => done(null);
