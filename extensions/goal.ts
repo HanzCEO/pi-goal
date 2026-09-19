@@ -54,7 +54,7 @@ const buildGoalInstructionPrompt = (topic: string): string =>
 
 Work through it step by step:
 
-0. **Explore**. Before anything, explore and gain enough context about the subject matter. Don't ask the user about the goal. Try to explore the codebase first. Only if you have a sudden question, DO IMMEDIATELY ASK the user. Do not postpone using goal_ask.
+0. **Explore**. Before anything, explore and gain enough context about the subject matter. Don't ask the user about the goal. Try to explore the codebase first. Only if you have a sudden question, DO IMMEDIATELY ASK the user. Do not postpone using goal_ask. This can be skipped if you already have investigation result before this message.
 
 1. **Refine**. If the goal is vague or has missing constraints, use goal_ask to ask me clarifying questions. Choose the right question type with this decision framework:
 
