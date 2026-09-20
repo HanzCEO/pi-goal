@@ -67,7 +67,7 @@ Work through it step by step:
    Ask ONE question at a time. Do not combine multiple clarifying questions into a single goal_ask call. Each question is asked separately.
    Keep asking until you have a clear, actionable goal.
 
-2. **Plan**. Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones.
+2. **Plan**. Decompose the goal into a small set of tasks. Each task needs a contract (what to do) and acceptance criteria (how to verify it is done). Tasks should be ordered so each builds on the completed state of the prior ones. Never ever execute tests or builds, only the authoritative auditor do this.
 
 3. **Approve**. Use goal_approve_plan to submit the refined goal and task list for my approval. If I reject it, revise and resubmit.
 
