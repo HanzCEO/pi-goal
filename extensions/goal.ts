@@ -10,7 +10,9 @@
  *   goal_approve_plan   Submit a task plan for user approval
  *   goal_update_task    Mark a task in-progress or completed
  *   goal_complete       Submit the goal for audit (requires all tasks done)
- *   goal_audit_result   Submit the auditor's verdict
+ *   goal_audit_criterion Record a verdict for one acceptance criterion
+ *   goal_audit_task    Record the verdict for one assigned task
+ *   goal_audit_result   Submit the auditor's shard verdict
  *   goal_fail           Mark the goal as failed
  *
  * Widget tracking:
@@ -103,8 +105,9 @@ __TASKS__
 ## Procedure
 1. Read the current state from __STATEPATH__ if you need the executor's claims.
 2. For each task assigned to you, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
-3. Immediately after verifying a task, call goal_audit_task with { taskId, passed, reason }. Do this for every task assigned to you.
-4. Keep working until every criterion is either verified or disproven.
+3. Verify the acceptance criteria one at a time. Immediately after you check each single criterion, call goal_audit_criterion with { taskId, index, passed, reason }. index is the 1-based position of that criterion in the task's numbered acceptance-criteria list. This drives the user's live progress bar, so record criteria as you go and never batch them at the end.
+4. Immediately after verifying a task, call goal_audit_task with { taskId, passed, reason }. Do this for every task assigned to you.
+5. Keep working until every criterion is either verified or disproven.
 
 ## Verdict
 When every assigned task has been recorded, call goal_audit_result exactly once with:
@@ -164,6 +167,13 @@ interface AuditConfig {
 	thinkingLevel: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
+// Per-criterion verification state. The array is parallel to
+// acceptanceCriteria, so criteriaStatus[i] belongs to acceptanceCriteria[i].
+// Only settled verdicts are persisted; the "currently verifying" cell is
+// derived at render time from the auditor that owns the task, which keeps the
+// auditor's tool surface to one call per criterion.
+type CriterionStatus = "pending" | "passed" | "failed";
+
 interface TaskState {
 	id: string;
 	description: string;
@@ -172,6 +182,8 @@ interface TaskState {
 	status: "pending" | "approved" | "in-progress" | "completed" | "failed";
 	auditResult: string | null;
 	error: string | null;
+	// Optional so state files written before per-criterion tracking still load.
+	criteriaStatus?: CriterionStatus[];
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +222,28 @@ function saveState(state: GoalState): void {
 function clearState(): void {
 	const p = getStatePath();
 	if (fs.existsSync(p)) fs.unlinkSync(p);
+}
+
+// ---------------------------------------------------------------------------
+// Per-criterion progress helpers
+// ---------------------------------------------------------------------------
+
+function pendingCriteria(count: number): CriterionStatus[] {
+	return Array.from({ length: Math.max(0, count) }, () => "pending" as CriterionStatus);
+}
+
+// Normalize a task's criterion array to the length of its acceptance criteria,
+// so a state file from an older run (or a hand-edited plan) never yields a bar
+// that is out of sync with the task definition.
+function taskCriteriaStatus(task: TaskState): CriterionStatus[] {
+	const total = task.acceptanceCriteria.length;
+	const raw = task.criteriaStatus ?? [];
+	const out: CriterionStatus[] = [];
+	for (let i = 0; i < total; i++) {
+		const value = raw[i];
+		out.push(value === "passed" || value === "failed" ? value : "pending");
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +474,13 @@ function renderWidgetLines(
 ): string[] {
 	const style = theme
 		? makeStyleHelpers(theme)
-		: { bold: (s: string) => s, italic: (s: string) => s, fg: (_c: string, s: string) => s, muted: (s: string) => s };
+		: {
+				bold: (s: string) => s,
+				italic: (s: string) => s,
+				fg: (_c: string, s: string) => s,
+				muted: (s: string) => s,
+				paint: (_groupIndex: number, s: string) => s,
+			};
 
 	const innerWidth = Math.max(20, width - 2);
 	const hr = style.fg("border", "─".repeat(innerWidth));
@@ -472,16 +512,22 @@ function renderWidgetLines(
 	out.push(style.fg("dim", hr));
 
 	if (state.status === "auditing") {
-		// Braille multi-progress: one compact bar row per group of four
-		// auditors. Each auditor owns one of the four dot rows inside the
-		// character, and the two dot columns give sub-cell resolution.
-		const tracks = auditTracks(state);
-		const rows = Math.min(2, Math.ceil(tracks.length / 4));
-		for (let row = 0; row < rows; row++) {
-			const group = tracks.slice(row * 4, row * 4 + 4);
-			out.push(`  ${renderBrailleRow(group, Math.max(8, innerWidth - 4), style)}`);
+		// Criteria bar: one cell per acceptance criterion, grouped and colored
+		// per task, with the criterion under verification animating.
+		const groups = buildCriterionGroups(state, "audit");
+		const barWidth = Math.max(8, innerWidth - 2);
+		const barRows = renderCriterionRows(groups, barWidth, style);
+		const shownRows = barRows.slice(0, 2);
+		if (shownRows.length === 0) {
+			out.push(`  ${style.fg("dim", "waiting for the first criterion verdict...")}`);
+		} else {
+			for (let i = 0; i < shownRows.length; i++) {
+				const truncated = i === shownRows.length - 1 && barRows.length > shownRows.length;
+				out.push(`  ${shownRows[i]}${truncated ? style.fg("dim", "…") : ""}`);
+			}
 		}
-		out.push(`  ${renderAuditLegend(tracks, Math.max(10, innerWidth - 2), style)}`);
+		const legend = renderCriterionLegend(groups, state.tasks, Math.max(10, innerWidth - 2), style);
+		if (legend) out.push(`  ${legend}`);
 
 		// Active task being verified by whichever auditor is running.
 		const active = findActiveAuditTask(state);
@@ -496,9 +542,9 @@ function renderWidgetLines(
 			const verdictText = truncateToWidth(state.auditFeedback, maxVerdict, "...", false);
 			out.push(`  ${verdictLabel} ${verdictText}`);
 		} else {
-			const hasQueued = tracks.some((track) => track.state === "queued");
+			const pendingShard = (state.audit?.shards ?? []).some((shard) => shard.status === "queued");
 			out.push(
-				`  ${style.fg("dim", hasQueued ? "Waiting for the next auditor slot..." : "Auditors are concluding verification...")}`,
+				`  ${style.fg("dim", pendingShard ? "Waiting for the next auditor slot..." : "Auditors are concluding verification...")}`,
 			);
 		}
 
@@ -521,14 +567,19 @@ function renderWidgetLines(
 		return out;
 	}
 
-	// Progress: 3/N (X failed)
+	// Progress: criteria bar grouped per task, with the task and percent counters.
 	if (total > 0) {
 		const pct = Math.round((completed / total) * 100);
-		const progressBar = makeProgressBar(completed, total, innerWidth - 18, style);
 		const progressLabel = style.fg("muted", `${completed}/${total} `);
 		const percentLabel = style.fg("accent", `${pct}%`);
 		const failedLabel = failed > 0 ? style.fg("error", `  ${failed} failed`) : "";
-		out.push(`${progressLabel}${progressBar}  ${percentLabel}${failedLabel}`);
+		const reserved = visibleWidth(progressLabel) + visibleWidth(percentLabel) + visibleWidth(failedLabel) + 2;
+		const barWidth = innerWidth - reserved;
+		const barRows = barWidth >= 8 ? renderCriterionRows(buildCriterionGroups(state, "exec"), barWidth, style).slice(0, 2) : [];
+		out.push(`${progressLabel}${barRows[0] ?? ""}  ${percentLabel}${failedLabel}`);
+		// Continuation rows line up with the bar, not with the counters.
+		const barIndent = " ".repeat(visibleWidth(progressLabel));
+		for (let i = 1; i < barRows.length; i++) out.push(`${barIndent}${barRows[i]}`);
 	}
 
 	// Task window: dynamic line budget based on terminal rows (leaves room for header, progress, divider)
@@ -551,6 +602,9 @@ interface ThemeLike {
 	fg(name: string, text: string): string;
 	bold(text: string): string;
 	italic(text: string): string;
+	// Present on the host Theme; used to pick truecolor over 256-color escapes
+	// for the per-task group hues.
+	getColorMode?(): string;
 }
 
 function makeStyleHelpers(theme: ThemeLike) {
@@ -568,156 +622,213 @@ function makeStyleHelpers(theme: ThemeLike) {
 		}
 	};
 
+	// Per-task-group hues live outside the theme palette, so they need raw
+	// ANSI. The mode comes from the theme when it exposes one; 256-color is
+	// the safe default because every terminal that renders the rest of the
+	// widget understands it.
+	const colorMode = (): "truecolor" | "256color" => {
+		try {
+			return theme.getColorMode?.() === "truecolor" ? "truecolor" : "256color";
+		} catch {
+			return "256color";
+		}
+	};
+
+	const paint = (groupIndex: number, s: string): string => {
+		const color = GROUP_COLORS[((groupIndex % GROUP_COLORS.length) + GROUP_COLORS.length) % GROUP_COLORS.length];
+		const ansi =
+			colorMode() === "truecolor" ? `\x1b[38;2;${color.rgb.join(";")}m` : `\x1b[38;5;${color.xterm}m`;
+		return `${ansi}${s}\x1b[39m`;
+	};
+
 	return {
 		fg,
+		paint,
 		bold: (s: string) => theme.bold(s),
 		italic: (s: string) => theme.italic(s),
 		muted: (s: string) => fg("muted", s),
 	};
 }
 
-function makeProgressBar(done: number, total: number, width: number, style: ReturnType<typeof makeStyleHelpers>): string {
-	if (width < 8) return "";
-	const filled = Math.round((done / total) * (width - 2));
-	const empty = width - 2 - filled;
-	const bar = "[" + "█".repeat(filled) + "░".repeat(empty) + "]";
-	const color = done === total ? "success" : "accent";
-	return style.fg(color, bar);
-}
-
 // ---------------------------------------------------------------------------
-// Braille multi-progress
-// Each braille cell is a 2x4 dot matrix. A group of up to four auditor tracks
-// maps onto the four dot rows (one row per track), and the two dot columns give
-// half-cell horizontal resolution. Consecutive cells with the same dominant
-// track share one color escape, so a 3-auditor bar costs at most a few escapes.
+// Criteria progress bar
+// One braille cell per acceptance criterion, in task order. A cell fills
+// vertically: empty cells sit on their base dot, verified cells are full, and
+// the criterion an auditor is currently verifying cycles through vertical fill
+// frames so the bar visibly moves while it works.
+//
+// Every cell of a task shares that task's color, and consecutive tasks get
+// different hues so group boundaries read at a glance. Failed criteria break
+// the group color on purpose: a failure must never blend into its neighbors.
 // ---------------------------------------------------------------------------
 
-interface AuditTrack {
-	id: string;
-	done: number;
-	total: number;
-	state: "queued" | "running" | "passed" | "failed" | "error";
+type CriterionCell = "pending" | "active" | "done" | "failed";
+
+interface CriterionGroup {
+	taskIndex: number;
+	cells: CriterionCell[];
 }
 
-const BRAILLE_LEVEL_BITS: Array<{ left: number; right: number }> = [
-	{ left: 0x01, right: 0x08 },
-	{ left: 0x02, right: 0x10 },
-	{ left: 0x04, right: 0x20 },
-	{ left: 0x40, right: 0x80 },
+const CRITERION_GLYPHS: Record<"pending" | "done" | "failed", string> = {
+	pending: "⠤",
+	done: "⠿",
+	failed: "⠭",
+};
+
+// Vertical fill frames. Every glyph is a four-dot column pattern, so stepping
+// through them reads as a bar filling inside the cell rather than a rotation.
+const CRITERION_ACTIVE_FRAMES = ["⠼", "⠶", "⠧", "⠏", "⠛", "⠹"];
+
+// Task group hues, as xterm-256 index plus the matching truecolor triplet. Ten
+// distinct hues before any repeat, which covers realistic plans; longer plans
+// wrap around.
+const GROUP_COLORS: Array<{ xterm: number; rgb: [number, number, number] }> = [
+	{ xterm: 203, rgb: [255, 95, 95] }, // red
+	{ xterm: 111, rgb: [135, 175, 255] }, // blue
+	{ xterm: 221, rgb: [255, 215, 95] }, // yellow
+	{ xterm: 114, rgb: [135, 215, 135] }, // green
+	{ xterm: 176, rgb: [215, 135, 215] }, // magenta
+	{ xterm: 117, rgb: [135, 215, 255] }, // cyan
+	{ xterm: 215, rgb: [255, 175, 95] }, // orange
+	{ xterm: 141, rgb: [175, 135, 255] }, // violet
+	{ xterm: 211, rgb: [255, 135, 175] }, // pink
+	{ xterm: 191, rgb: [215, 255, 95] }, // lime
 ];
 
-function auditTrackColor(track: AuditTrack): string {
-	switch (track.state) {
-		case "passed":
-			return "success";
-		case "failed":
-		case "error":
-			return "error";
-		case "running":
-			return "accent";
-		default:
-			return "dim";
+let animationTick = 0;
+
+// True when an auditor is currently responsible for this task, which is what
+// makes its next pending criterion animate.
+function taskUnderVerification(state: GoalState, taskId: string): boolean {
+	const shards = state.audit?.shards;
+	if (!shards || shards.length === 0) return false;
+	for (const shard of shards) {
+		if (shard.taskIds.includes(taskId)) return shard.status === "running";
 	}
+	return false;
 }
 
-function brailleCell(bits: number): string {
-	return bits === 0 ? " " : String.fromCharCode(0x2800 + bits);
-}
+function criterionCells(task: TaskState, state: GoalState, mode: "audit" | "exec"): CriterionCell[] {
+	const cells = taskCriteriaStatus(task).map<CriterionCell>((status) => {
+		if (status === "passed") return "done";
+		if (status === "failed") return "failed";
+		return "pending";
+	});
+	if (cells.length === 0) return cells;
 
-function renderBrailleRow(
-	tracks: AuditTrack[],
-	width: number,
-	style: ReturnType<typeof makeStyleHelpers>,
-): string {
-	if (width <= 0 || tracks.length === 0) return "";
-	const cells = new Array<number>(width).fill(0);
-	const colors = new Array<string | null>(width).fill(null);
-	// When several tracks share a cell, the most urgent one wins the color.
-	const rank: Record<string, number> = { dim: 0, success: 1, accent: 2, error: 3 };
-
-	// A single track uses all four dot rows so it reads as a thick bar. Two to
-	// four tracks each get one row.
-	const levels = tracks.length === 1 ? [0, 1, 2, 3] : [0, 1, 2, 3].slice(0, tracks.length);
-	for (const level of levels) {
-		const track = tracks[tracks.length === 1 ? 0 : level];
-		if (track.state === "queued") continue;
-		const fraction = track.total > 0 ? Math.min(1, track.done / track.total) : 0;
-		const dots = Math.round(fraction * width * 2);
-		if (dots <= 0) continue;
-		const color = auditTrackColor(track);
-		for (let dot = 0; dot < dots; dot++) {
-			const cell = Math.floor(dot / 2);
-			if (cell >= width) break;
-			const bits = BRAILLE_LEVEL_BITS[level];
-			cells[cell] |= dot % 2 === 0 ? bits.left : bits.right;
-			const current = colors[cell];
-			if (current === null || rank[color] >= rank[current]) colors[cell] = color;
-		}
+	if (mode === "exec") {
+		// Until an auditor records real per-criterion results, the task's own
+		// status is the only progress signal there is.
+		if (task.status === "completed") return cells.map(() => "done" as CriterionCell);
+		if (task.status === "failed") return cells.map(() => "failed" as CriterionCell);
 	}
 
+	// "approved" only means the task may start, so only an in-progress task
+	// animates during execution.
+	const working = mode === "audit" ? taskUnderVerification(state, task.id) : task.status === "in-progress";
+	if (working) {
+		const next = cells.indexOf("pending");
+		if (next !== -1) cells[next] = "active";
+	}
+	return cells;
+}
+
+function buildCriterionGroups(state: GoalState, mode: "audit" | "exec"): CriterionGroup[] {
+	return state.tasks
+		.map((task, taskIndex) => ({ taskIndex, cells: criterionCells(task, state, mode) }))
+		.filter((group) => group.cells.length > 0);
+}
+
+function criterionGlyph(cell: CriterionCell): string {
+	if (cell === "active") return CRITERION_ACTIVE_FRAMES[animationTick % CRITERION_ACTIVE_FRAMES.length];
+	return CRITERION_GLYPHS[cell];
+}
+
+function paintCriterionCells(cells: CriterionCell[], groupIndex: number, style: ReturnType<typeof makeStyleHelpers>): string {
 	let out = "";
-	let index = 0;
-	while (index < width) {
-		const color = colors[index];
-		let end = index;
-		let text = "";
-		while (end < width && colors[end] === color) {
-			text += brailleCell(cells[end]);
-			end++;
+	let run = "";
+	let runFailed = false;
+	const flushRun = (): void => {
+		if (run.length === 0) return;
+		out += runFailed ? style.fg("error", run) : style.paint(groupIndex, run);
+		run = "";
+	};
+	for (const cell of cells) {
+		const failed = cell === "failed";
+		if (failed !== runFailed) {
+			flushRun();
+			runFailed = failed;
 		}
-		out += color ? style.fg(color, text) : text;
-		index = end;
+		run += criterionGlyph(cell);
 	}
+	flushRun();
 	return out;
 }
 
-function renderAuditLegend(
-	tracks: AuditTrack[],
+// Lay the groups out left to right, wrapping at width. A group that does not
+// fit in the remaining cells moves to the next row whole; only a group longer
+// than a full row is split.
+function renderCriterionRows(
+	groups: CriterionGroup[],
+	width: number,
+	style: ReturnType<typeof makeStyleHelpers>,
+): string[] {
+	if (width <= 0 || groups.length === 0) return [];
+	const rows: string[] = [];
+	let current = "";
+	let currentWidth = 0;
+	const flush = (): void => {
+		if (current.length === 0) return;
+		rows.push(current);
+		current = "";
+		currentWidth = 0;
+	};
+
+	for (const group of groups) {
+		const size = group.cells.length;
+		if (currentWidth > 0 && currentWidth + size > width && size <= width) flush();
+		let offset = 0;
+		while (offset < size) {
+			if (currentWidth >= width) flush();
+			const take = Math.min(width - currentWidth, size - offset);
+			current += paintCriterionCells(group.cells.slice(offset, offset + take), group.taskIndex, style);
+			currentWidth += take;
+			offset += take;
+			if (offset < size) flush();
+		}
+	}
+	flush();
+	return rows;
+}
+
+// Legend: which color belongs to which task, plus that task's verified count.
+// Without it the colors are decorative.
+function renderCriterionLegend(
+	groups: CriterionGroup[],
+	tasks: TaskState[],
 	width: number,
 	style: ReturnType<typeof makeStyleHelpers>,
 ): string {
-	if (tracks.length === 0) return style.fg("dim", "no tasks to verify");
-	const parts = tracks.map((track) => style.fg(auditTrackColor(track), `${track.id} ${track.done}/${track.total}`));
-	const done = tracks.reduce((sum, track) => sum + track.done, 0);
-	const total = tracks.reduce((sum, track) => sum + track.total, 0);
-	const overall = style.fg("muted", `  ${done}/${total}`);
+	if (groups.length === 0) return "";
+	const parts = groups.map((group) => {
+		const task = tasks[group.taskIndex];
+		const done = group.cells.filter((cell) => cell === "done").length;
+		const label = truncateToWidth(task.id, 16, "...", false);
+		return style.paint(group.taskIndex, `${label} ${done}/${group.cells.length}`);
+	});
 
 	let out = "";
 	let shown = 0;
 	for (const part of parts) {
 		const next = out.length > 0 ? `${out}${style.fg("dim", " · ")}${part}` : part;
-		// Reserve a few cells for a "+N" hidden-auditor marker.
-		if (visibleWidth(next + overall) + 4 > width) break;
+		// Reserve cells for a "+N" marker when the legend has to drop entries.
+		if (visibleWidth(next) + 4 > width) break;
 		out = next;
 		shown += 1;
 	}
 	if (out.length === 0) return truncateToWidth(parts[0] ?? "", width, "...", false);
-	const hidden = tracks.length - shown;
-	const hiddenLabel = hidden > 0 ? style.fg("dim", ` +${hidden}`) : "";
-	return out + hiddenLabel + overall;
-}
-
-function auditTracks(state: GoalState): AuditTrack[] {
-	const shards = state.audit?.shards;
-	if (shards && shards.length > 0) {
-		return shards.map((shard) => {
-			const total = shard.taskIds.length;
-			const done = Math.min(total, shard.verified ?? Object.keys(shard.results || {}).length);
-			let trackState: AuditTrack["state"];
-			if (shard.status === "queued") trackState = "queued";
-			else if (shard.status === "running") trackState = "running";
-			else if (shard.status === "error") trackState = "error";
-			else if (shard.approved === true) trackState = "passed";
-			else if (shard.approved === false) trackState = "failed";
-			else trackState = "running";
-			return { id: shard.id, done, total, state: trackState };
-		});
-	}
-	// Legacy single-auditor state (no shard records).
-	const total = state.tasks.length;
-	const done = state.tasks.filter((task) => task.auditResult).length;
-	return [{ id: "A1", done, total, state: "running" }];
+	const hidden = groups.length - shown;
+	return hidden > 0 ? `${out}${style.fg("dim", ` +${hidden}`)}` : out;
 }
 
 function findActiveAuditTask(state: GoalState): { auditorId: string; task: TaskState } | null {
@@ -802,7 +913,15 @@ function formatAuditReportMarkdown(
 			const isDone = t.status === "completed";
 			const icon = isDone ? "[PASS]" : "[FAIL]";
 			const reason = t.auditResult || t.error || (isDone ? "Verified against acceptance criteria" : "Criteria not met");
-			sections.push(`* **${icon} Task ${i + 1} (${t.id}):** ${t.description}\n  * Detail: ${reason}`);
+			const criteria = taskCriteriaStatus(t);
+			const verified = criteria.filter((s) => s === "passed").length;
+			const criteriaLabel = criteria.length > 0 ? `\n  * Criteria: ${verified}/${criteria.length} verified` : "";
+			const failedCriteria = criteria
+				.map((status, index) => ({ status, criterion: t.acceptanceCriteria[index] }))
+				.filter((entry) => entry.status === "failed")
+				.map((entry) => entry.criterion);
+			const failedLabel = failedCriteria.length > 0 ? `\n  * Failed criteria: ${failedCriteria.join("; ")}` : "";
+			sections.push(`* **${icon} Task ${i + 1} (${t.id}):** ${t.description}\n  * Detail: ${reason}${criteriaLabel}${failedLabel}`);
 		}
 	}
 
@@ -992,16 +1111,57 @@ let widgetCache: { container: Container; texts: Text[] } | null = null;
 // refresh rebuilds from fresh state. Centralized so every clear path
 // (audit completion, rejection, fail, stop, delete, clear) stays consistent.
 function clearWidget(ctx: ExtensionContext): void {
+	stopWidgetAnimation();
 	ctx.ui.setWidget("pi-goal", undefined);
 	widgetCache = null;
+}
+
+// ---------------------------------------------------------------------------
+// Animation ticker
+// The in-progress criteria cells step through their vertical fill frames, so
+// the widget has to be repainted while any cell is animating. The timer runs
+// only when a cell is actually in flight, and it re-registers the widget with
+// the same cached Container, so a tick is a cheap in-place text update.
+// ---------------------------------------------------------------------------
+
+const WIDGET_ANIMATION_MS = 110;
+let widgetAnimationTimer: ReturnType<typeof setInterval> | null = null;
+
+function widgetIsAnimating(state: GoalState): boolean {
+	if (state.status === "auditing") {
+		return buildCriterionGroups(state, "audit").some((group) => group.cells.includes("active"));
+	}
+	if (state.status === "active") {
+		return buildCriterionGroups(state, "exec").some((group) => group.cells.includes("active"));
+	}
+	return false;
+}
+
+function startWidgetAnimation(): void {
+	if (widgetAnimationTimer) return;
+	widgetAnimationTimer = setInterval(() => {
+		animationTick += 1;
+		if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
+	}, WIDGET_ANIMATION_MS);
+	// Do not keep the process alive just for a progress animation.
+	(widgetAnimationTimer as { unref?: () => void }).unref?.();
+}
+
+function stopWidgetAnimation(): void {
+	if (!widgetAnimationTimer) return;
+	clearInterval(widgetAnimationTimer);
+	widgetAnimationTimer = null;
 }
 
 function refreshWidget(ctx: ExtensionContext): void {
 	const state = loadState();
 	if (!state || state.status === "completed" || state.status === "failed" || state.status === "stopped") {
+		stopWidgetAnimation();
 		clearWidget(ctx);
 		return;
 	}
+	if (widgetIsAnimating(state)) startWidgetAnimation();
+	else stopWidgetAnimation();
 	const yoloActive = isYoloActive(ctx);
 	ctx.ui.setWidget("pi-goal", (tui, theme) => {
 		const term = (tui as { terminal?: { columns?: number; rows?: number } }).terminal;
@@ -1227,6 +1387,41 @@ function recordShardTask(auditorId: string, taskId: string, passed: boolean, rea
 	saveState(state);
 }
 
+// Persist one criterion verdict. Returns the criterion's text and the task's
+// running count so the tool can answer with something the auditor can check
+// against what it just verified.
+function recordCriterion(
+	taskId: string,
+	index: number,
+	passed: boolean,
+): { ok: true; task: TaskState; criterion: string; done: number; total: number } | { ok: false; error: string } {
+	const state = loadState();
+	if (!state) return { ok: false, error: "No goal state found." };
+	const task = state.tasks.find((t) => t.id === taskId);
+	if (!task) {
+		return { ok: false, error: `Task "${taskId}" not found. Available tasks: ${state.tasks.map((t) => t.id).join(", ")}` };
+	}
+	const total = task.acceptanceCriteria.length;
+	if (!Number.isInteger(index) || index < 1 || index > total) {
+		const list = task.acceptanceCriteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
+		return {
+			ok: false,
+			error: `Criterion index ${index} is out of range for ${taskId} (1-${total}). Criteria:\n${list}`,
+		};
+	}
+	const statuses = taskCriteriaStatus(task);
+	statuses[index - 1] = passed ? "passed" : "failed";
+	task.criteriaStatus = statuses;
+	saveState(state);
+	return {
+		ok: true,
+		task,
+		criterion: task.acceptanceCriteria[index - 1],
+		done: statuses.filter((s) => s === "passed" || s === "failed").length,
+		total,
+	};
+}
+
 function recordShardVerdict(
 	auditorId: string,
 	verdict: { approved: boolean; feedback: string; failedTasks: { id: string; reason: string }[] },
@@ -1347,7 +1542,7 @@ interface AuditAssignment {
 function buildAuditorSystemPrompt(state: GoalState, projectCwd: string, assignment: AuditAssignment): string {
 	const tasks = assignment.tasks
 		.map((t, i) => {
-			const criteria = t.acceptanceCriteria.map((c) => `      - ${c}`).join("\n");
+			const criteria = t.acceptanceCriteria.map((c, index) => `      ${index + 1}. ${c}`).join("\n");
 			return `  ${i + 1}. ${t.id}: ${t.description}\n     contract: ${t.contract}\n     acceptance criteria:\n${criteria}`;
 		})
 		.join("\n\n");
@@ -1547,12 +1742,14 @@ interface ShardSink {
 }
 
 // Record the verdict for a single task. Called by the auditor after verifying
-// each assigned task, which is what drives the per-shard progress track.
+// each assigned task, which is what drives the per-shard progress track. The
+// per-criterion detail comes from goal_audit_criterion, which the auditor calls
+// as it works.
 function makeAuditTaskTool(auditorId: string, allowedTaskIds: Set<string>, sink: ShardSink) {
 	return defineTool({
 		name: "goal_audit_task",
 		label: `Record task verdict (${auditorId})`,
-		description: `AUDITOR-ONLY (${auditorId}). Record the verdict for ONE assigned task after verifying its acceptance criteria. Call this once per assigned task, before submitting the shard verdict.`,
+		description: `AUDITOR-ONLY (${auditorId}). Record the verdict for ONE assigned task after verifying its acceptance criteria (recording each one with goal_audit_criterion as you go). Call this once per assigned task, before submitting the shard verdict.`,
 		parameters: Type.Object({
 			taskId: Type.String({ description: "The id of the assigned task" }),
 			passed: Type.Boolean({ description: "True if every acceptance criterion of this task is met" }),
@@ -1587,6 +1784,72 @@ function makeAuditTaskTool(auditorId: string, allowedTaskIds: Set<string>, sink:
 					},
 				],
 				details: { error: null as string | null, taskId: params.taskId, passed: params.passed },
+			};
+		},
+	});
+}
+
+// Record one acceptance criterion. This is the granular signal behind the
+// criteria bar: the auditor calls it as it verifies, so the bar fills cell by
+// cell instead of jumping a whole task at a time.
+function makeAuditCriterionTool(auditorId: string, allowedTaskIds: Set<string>) {
+	return defineTool({
+		name: "goal_audit_criterion",
+		label: `Record criterion verdict (${auditorId})`,
+		description: `AUDITOR-ONLY (${auditorId}). Record the verdict for ONE acceptance criterion of an assigned task, immediately after you check it. index is the 1-based position of the criterion in that task's acceptance-criteria list. Call this once per criterion as you verify it, never as a batch at the end, so the user sees the progress bar advance while you work.`,
+		parameters: Type.Object({
+			taskId: Type.String({ description: "The id of the assigned task" }),
+			index: Type.Integer({ minimum: 1, description: "1-based position of the acceptance criterion inside that task" }),
+			passed: Type.Boolean({ description: "True if this criterion is met, false if it is not" }),
+			reason: Type.Optional(Type.String({ description: "Short evidence for the verdict on this criterion" })),
+		}),
+		executionMode: "sequential",
+
+		async execute(_toolCallId, params) {
+			if (!allowedTaskIds.has(params.taskId)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Task ${params.taskId} is not assigned to ${auditorId}. Assigned tasks: ${[...allowedTaskIds].join(", ")}`,
+						},
+					],
+					details: { error: "not_assigned" as string | null, taskId: params.taskId, index: params.index },
+				};
+			}
+
+			const recorded = recordCriterion(params.taskId, params.index, params.passed);
+			if (!recorded.ok) {
+				return {
+					content: [{ type: "text", text: recorded.error }],
+					details: { error: "bad_criterion" as string | null, taskId: params.taskId, index: params.index },
+				};
+			}
+
+			const marker = params.passed ? "PASS" : "FAIL";
+			appendAuditLog(
+				[
+					`${marker} ${params.taskId} criterion ${params.index}/${recorded.total} (${recorded.done}/${recorded.total}): ${sanitizeLogLine(recorded.criterion).slice(0, 80)}`,
+				],
+				auditorId,
+			);
+			if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Recorded ${marker} for ${params.taskId} criterion ${params.index}/${recorded.total} (${recorded.done}/${recorded.total} criteria recorded). Continue with the next criterion.`,
+					},
+				],
+				details: {
+					error: null as string | null,
+					taskId: params.taskId,
+					index: params.index,
+					passed: params.passed,
+					done: recorded.done,
+					total: recorded.total,
+				},
 			};
 		},
 	});
@@ -1709,8 +1972,12 @@ async function runOneAuditor(args: {
 			sessionManager: SessionManager.inMemory(sessionCwd),
 			model: ctx.model,
 			thinkingLevel: cfg.thinkingLevel,
-			tools: [...AUDITOR_TOOLS, "goal_audit_task", "goal_audit_result"],
-			customTools: [makeAuditTaskTool(auditorId, allowedTaskIds, sink), makeAuditVerdictTool(auditorId, allowedTaskIds, sink)],
+			tools: [...AUDITOR_TOOLS, "goal_audit_criterion", "goal_audit_task", "goal_audit_result"],
+			customTools: [
+				makeAuditCriterionTool(auditorId, allowedTaskIds),
+				makeAuditTaskTool(auditorId, allowedTaskIds, sink),
+				makeAuditVerdictTool(auditorId, allowedTaskIds, sink),
+			],
 		});
 		session = created.session;
 		abortSession = (): void => {
@@ -1765,7 +2032,7 @@ async function runOneAuditor(args: {
 
 		try {
 			await session.prompt(
-				`You are ${auditorId}. Read your assignment, verify every assigned task, record each one with goal_audit_task, then submit your shard verdict with goal_audit_result.`,
+				`You are ${auditorId}. Read your assignment, verify every assigned task, record each acceptance criterion with goal_audit_criterion as you verify it, record each finished task with goal_audit_task, then submit your shard verdict with goal_audit_result.`,
 			);
 
 			let followUps = 0;
@@ -1773,7 +2040,7 @@ async function runOneAuditor(args: {
 				followUps += 1;
 				appendAuditLog([`no verdict yet; following up (${followUps}/2)`], auditorId);
 				await session.prompt(
-					"You have not submitted your shard verdict. Record any remaining assigned task with goal_audit_task, then call goal_audit_result exactly once with approved (boolean), feedback (string), and on rejection the failedTasks (id and reason). Do not end your turn before calling it.",
+					"You have not submitted your shard verdict. Record any remaining criterion with goal_audit_criterion, record any remaining assigned task with goal_audit_task, then call goal_audit_result exactly once with approved (boolean), feedback (string), and on rejection the failedTasks (id and reason). Do not end your turn before calling it.",
 				);
 			}
 		} finally {
@@ -1816,6 +2083,12 @@ function runAudit(ctx: ExtensionContext, _api: ExtensionAPI): Promise<{ approved
 		if (!state || state.status !== "auditing") return null;
 
 		const cfg = loadAuditConfig();
+
+		// Every audit round starts from a clean criteria bar: stale verdicts from
+		// a previous round must not make a task look verified before this round's
+		// auditor has actually looked at it.
+		state.tasks = state.tasks.map((task) => ({ ...task, criteriaStatus: pendingCriteria(task.acceptanceCriteria.length) }));
+
 		const shards = shardTasks(state.tasks, cfg.auditors);
 		const sinks: ShardSink[] = shards.map(() => ({ results: new Map(), verdict: null }));
 
@@ -2014,6 +2287,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		stopWatcher();
+		stopWidgetAnimation();
 		activeWidgetCtx = null;
 	});
 
@@ -2202,6 +2476,7 @@ export default function (pi: ExtensionAPI) {
 				status: "pending" as const,
 				auditResult: null,
 				error: null,
+				criteriaStatus: pendingCriteria(t.acceptanceCriteria.length),
 			}));
 			state.status = "active";
 			state.auditFeedback = null;
@@ -2614,7 +2889,10 @@ export default function (pi: ExtensionAPI) {
 						completed: "+",
 						failed: "x",
 					};
-					return `  ${icons[t.status] || "o"} ${t.description} (${t.status})`;
+					const criteria = taskCriteriaStatus(t);
+					const verified = criteria.filter((s) => s === "passed" || s === "failed").length;
+					const criteriaLabel = criteria.length > 0 ? ` [${verified}/${criteria.length} criteria]` : "";
+					return `  ${icons[t.status] || "o"} ${t.description} (${t.status})${criteriaLabel}`;
 				}),
 			];
 
