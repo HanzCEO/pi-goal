@@ -20,13 +20,15 @@
  *
  * Audit loop:
  *   `goal_complete` does not finalize the goal. It transitions the state
- *   to "auditing" and spawns an isolated auditor in-process via the pi SDK
- *   (createAgentSession) with a fresh, bounded context. The auditor's
- *   thinking tokens and tool calls are streamed live into the widget's
- *   audit log so the user watches the audit happen. The auditor submits
- *   its verdict through goal_audit_result (AUDITOR-ONLY), which either
- *   approves (transitioning to "completed") or rejects (returning tasks
- *   to "pending" so the host can re-execute and call goal_complete again).
+ *   to "auditing" and dispatches one isolated auditor per task shard in
+ *   parallel, each in its own git worktree via the pi SDK
+ *   (createAgentSession). The auditors' thinking tokens and tool calls are
+ *   streamed live into the widget's audit log so the user watches the audit
+ *   happen. Each auditor records per-task results through goal_audit_task and
+ *   a shard verdict through goal_audit_result (AUDITOR-ONLY). The coordinator
+ *   merges all shard verdicts: the goal is approved only when every task
+ *   passed. On rejection the failing tasks return to "pending" so the host
+ *   can re-execute and call goal_complete again.
  *
  * Built on the research from the pi-goal project:
  *   - Workers execute in fresh, bounded contexts
@@ -37,6 +39,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, defineTool, getAgentDir, getMarkdownTheme, getSelectListTheme, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -75,15 +78,15 @@ Work through it step by step:
 
 5. **Mark done**. After each task is complete, immediately call goal_update_task with taskId and status "completed". Do not procrastinate. Mark it done right after verification.
 
-6. **Complete**. When all tasks are marked done, call goal_complete with a summary. This spawns an isolated auditor in the background (handled by the goal extension, not by you). Its thinking and tool calls stream into the goal panel above the editor while it verifies the work.
+6. **Complete**. When all tasks are marked done, call goal_complete with a summary. This dispatches parallel isolated auditors (one per task shard, handled by the goal extension, not by you). Their thinking and tool calls stream into the goal panel above the editor while they verify the work in isolated git worktrees.
 
-7. **Audit result**. goal_audit_result is AUDITOR-ONLY. The in-process auditor calls it directly to submit its verdict. You do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
+7. **Audit result**. goal_audit_result is AUDITOR-ONLY. The in-process auditors call it directly to submit their shard verdicts, and the coordinator merges them. You do not call it. On rejection, fix the failing tasks (they will be reset to pending) and call goal_complete again. On approval, the goal is finalized.
 
 The state file at .pi/goal/state.json is updated automatically. You can read it to track progress.`;
 
 const AUDITOR_SYSTEM_PROMPT_TEMPLATE = `You are the goal auditor for an agentic workflow. Your job is to verify, with a fresh and critical eye, that the work delivered for a goal actually meets every acceptance criterion. You are an independent reviewer: trust nothing, verify everything yourself.
 
-You have read-only verification tools (read, bash, grep, find, ls) plus write/edit only when you must create test artifacts; you must NEVER modify the goal's state file (.pi/goal/state.json).
+You have read-only verification tools (read, bash, grep, find, ls) plus write/edit only when you must create test artifacts; you must NEVER modify the goal's state file (__STATEPATH__).
 
 ## Goal
 __GOAL__
@@ -91,19 +94,23 @@ __GOAL__
 ## Claimed work summary (from the executor)
 __RESULT__
 
+## Your assignment
+__ASSIGNMENT__
+
 ## Tasks and acceptance criteria to verify
 __TASKS__
 
 ## Procedure
-1. Read the current state from .pi/goal/state.json to see what the executor claims.
-2. For each task, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
-3. Keep working until every criterion is either verified or disproven.
+1. Read the current state from __STATEPATH__ if you need the executor's claims.
+2. For each task assigned to you, inspect the actual deliverables: read the files, run the commands, check the artifacts. Where a criterion is verifiable by running code or checking a file, do it. Do not take the executor's word.
+3. Immediately after verifying a task, call goal_audit_task with { taskId, passed, reason }. Do this for every task assigned to you.
+4. Keep working until every criterion is either verified or disproven.
 
 ## Verdict
-When you are done, call the tool goal_audit_result exactly once with:
-- approved: true if EVERY acceptance criterion of EVERY task is met, else false.
+When every assigned task has been recorded, call goal_audit_result exactly once with:
+- approved: true if EVERY acceptance criterion of EVERY task assigned to you is met, else false.
 - feedback: a concise verdict explaining what you verified and, on rejection, what failed.
-- failedTasks: only when approved=false, the list of { id, reason } for each task that did not meet its criteria. Omit the field when approved=true.
+- failedTasks: only when approved=false, the list of { id, reason } for each assigned task that did not meet its criteria. Omit the field when approved=true.
 
 Be strict but fair. A single unmet criterion means rejection.`;
 
@@ -121,10 +128,40 @@ interface GoalState {
 	result: string | null;
 	auditFeedback: string | null;
 	auditLog: string[];
+	audit?: AuditRunState | null;
 	yoloMode: boolean;
 	yoloSessionId: string | null;
 	createdAt: number;
 	updatedAt: number;
+}
+
+interface AuditRunState {
+	startedAt: number;
+	finishedAt: number | null;
+	strategy: "per-task";
+	auditors: number;
+	shards: AuditShardState[];
+}
+
+interface AuditShardState {
+	id: string;
+	taskIds: string[];
+	status: "queued" | "running" | "verdict" | "error";
+	worktree: string | null;
+	verified: number;
+	approved: boolean | null;
+	feedback: string | null;
+	failedTasks: { id: string; reason: string }[];
+	results: Record<string, { passed: boolean; reason: string | null }>;
+}
+
+interface AuditConfig {
+	auditors: number;
+	maxConcurrency: number;
+	worktree: boolean;
+	linkPaths: string[];
+	timeoutMs: number;
+	thinkingLevel: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 interface TaskState {
@@ -175,6 +212,99 @@ function clearState(): void {
 	if (fs.existsSync(p)) fs.unlinkSync(p);
 }
 
+// ---------------------------------------------------------------------------
+// Audit configuration. Lives next to the state file in .pi/goal/config.json.
+// Environment variables override the file, so one-off runs do not need a file
+// edit. Auditors are capped by the number of tasks at dispatch time.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_AUDIT_CONFIG: AuditConfig = {
+	auditors: 3,
+	maxConcurrency: 3,
+	worktree: true,
+	linkPaths: ["node_modules", ".venv", "venv"],
+	timeoutMs: 15 * 60 * 1000,
+	thinkingLevel: "low",
+};
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+	const n = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+function parseBool(value: unknown, fallback: boolean): boolean {
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		if (/^(1|true|on|yes)$/i.test(value)) return true;
+		if (/^(0|false|off|no)$/i.test(value)) return false;
+	}
+	return fallback;
+}
+
+function isThinkingLevel(value: unknown): value is AuditConfig["thinkingLevel"] {
+	return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
+}
+
+function getAuditConfigPath(): string {
+	return path.join(getStateDir(), "config.json");
+}
+
+function loadAuditConfig(): AuditConfig {
+	let raw: Record<string, unknown> = {};
+	const configPath = getAuditConfigPath();
+	if (fs.existsSync(configPath)) {
+		try {
+			const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+			const audit = parsed.audit;
+			raw = audit && typeof audit === "object" ? (audit as Record<string, unknown>) : parsed;
+		} catch {
+			raw = {};
+		}
+	}
+	const env = process.env;
+	return {
+		auditors: clampInt(env.PI_GOAL_AUDITORS ?? raw.auditors, 1, 16, DEFAULT_AUDIT_CONFIG.auditors),
+		maxConcurrency: clampInt(
+			env.PI_GOAL_AUDIT_CONCURRENCY ?? raw.maxConcurrency,
+			1,
+			8,
+			DEFAULT_AUDIT_CONFIG.maxConcurrency,
+		),
+		worktree: parseBool(env.PI_GOAL_AUDIT_WORKTREE ?? raw.worktree, DEFAULT_AUDIT_CONFIG.worktree),
+		linkPaths: Array.isArray(raw.linkPaths)
+			? raw.linkPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
+			: DEFAULT_AUDIT_CONFIG.linkPaths,
+		timeoutMs: clampInt(
+			env.PI_GOAL_AUDIT_TIMEOUT_MS ?? raw.timeoutMs,
+			30_000,
+			3_600_000,
+			DEFAULT_AUDIT_CONFIG.timeoutMs,
+		),
+		thinkingLevel: isThinkingLevel(raw.thinkingLevel) ? raw.thinkingLevel : DEFAULT_AUDIT_CONFIG.thinkingLevel,
+	};
+}
+
+function saveAuditConfig(patch: Partial<AuditConfig>): AuditConfig {
+	const configPath = getAuditConfigPath();
+	let existing: Record<string, unknown> = {};
+	if (fs.existsSync(configPath)) {
+		try {
+			existing = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+		} catch {
+			existing = {};
+		}
+	}
+	const audit = (existing.audit && typeof existing.audit === "object" ? existing.audit : {}) as Record<string, unknown>;
+	ensureStateDir();
+	fs.writeFileSync(
+		configPath,
+		JSON.stringify({ ...existing, audit: { ...audit, ...patch } }, null, 2),
+		"utf-8",
+	);
+	return loadAuditConfig();
+}
+
 // Yolo mode is persisted in the goal state so it survives process lifecycles
 // (module reloads, /reload, process restarts within the same directory). It is
 // scoped to the session that enabled it: effective when the recorded
@@ -219,7 +349,7 @@ function tailTruncateToWidth(text: string, maxWidth: number, ellipsis = ""): str
 	// The label is kept only if the ellipsis plus at least one content cell fits.
 	let label = "";
 	let content = text;
-	const labelMatch = text.match(/^[^:]{1,12}: /);
+	const labelMatch = text.match(/^[^:]{1,24}: /);
 	if (labelMatch) {
 		const candidate = labelMatch[0];
 		if (visibleWidth(candidate) + ellipsisWidth + 1 <= maxWidth) {
@@ -342,36 +472,41 @@ function renderWidgetLines(
 	out.push(style.fg("dim", hr));
 
 	if (state.status === "auditing") {
-		// Compact live audit status (keeps total widget lines <= 6 to prevent scrollback flicker)
-		const verifiedCount = completed + failed;
-		const pct = total > 0 ? Math.round((verifiedCount / total) * 100) : 0;
-		const progressBar = makeProgressBar(verifiedCount, Math.max(1, total), Math.min(24, innerWidth - 30), style);
-		const countLabel = style.fg("muted", `Verified: ${verifiedCount}/${total} `);
-		const pctLabel = style.fg("accent", `${pct}%`);
-		const failBadge = failed > 0 ? style.fg("error", ` (${failed} failed)`) : "";
-		out.push(`  ${countLabel}${progressBar} ${pctLabel}${failBadge}`);
+		// Braille multi-progress: one compact bar row per group of four
+		// auditors. Each auditor owns one of the four dot rows inside the
+		// character, and the two dot columns give sub-cell resolution.
+		const tracks = auditTracks(state);
+		const rows = Math.min(2, Math.ceil(tracks.length / 4));
+		for (let row = 0; row < rows; row++) {
+			const group = tracks.slice(row * 4, row * 4 + 4);
+			out.push(`  ${renderBrailleRow(group, Math.max(8, innerWidth - 4), style)}`);
+		}
+		out.push(`  ${renderAuditLegend(tracks, Math.max(10, innerWidth - 2), style)}`);
 
-		// Active task being verified
-		const activeTask = state.tasks.find((t) => !t.auditResult);
-		if (activeTask) {
-			const taskPrefix = style.bold(style.fg("warning", "Checking:"));
+		// Active task being verified by whichever auditor is running.
+		const active = findActiveAuditTask(state);
+		if (active) {
+			const taskPrefix = style.bold(style.fg("warning", `Checking ${active.auditorId}:`));
 			const maxDesc = Math.max(10, innerWidth - visibleWidth(taskPrefix) - 12);
-			const desc = truncateToWidth(activeTask.description, maxDesc, "...", false);
-			out.push(`  ${taskPrefix} [${activeTask.id}] ${desc}`);
+			const desc = truncateToWidth(active.task.description, maxDesc, "...", false);
+			out.push(`  ${taskPrefix} [${active.task.id}] ${desc}`);
 		} else if (state.auditFeedback && state.auditFeedback !== "auditor pending...") {
 			const verdictLabel = style.bold(style.fg("accent", "Verdict:"));
 			const maxVerdict = Math.max(10, innerWidth - visibleWidth(verdictLabel) - 6);
 			const verdictText = truncateToWidth(state.auditFeedback, maxVerdict, "...", false);
 			out.push(`  ${verdictLabel} ${verdictText}`);
 		} else {
-			out.push(`  ${style.fg("dim", "Auditor is concluding verification...")}`);
+			const hasQueued = tracks.some((track) => track.state === "queued");
+			out.push(
+				`  ${style.fg("dim", hasQueued ? "Waiting for the next auditor slot..." : "Auditors are concluding verification...")}`,
+			);
 		}
 
-		// Latest log line or streaming thinking delta
+		// Latest log line or streaming thinking delta (any auditor).
 		const log = state.auditLog || [];
 		if (log.length > 0) {
 			const lastRaw = sanitizeLogLine(log[log.length - 1]);
-			const isThinking = lastRaw.startsWith("thinking: ");
+			const isThinking = lastRaw.includes("] thinking: ");
 			const maxW = Math.max(10, innerWidth - 6);
 			const displayLog = isThinking
 				? tailTruncateToWidth(lastRaw, maxW)
@@ -448,6 +583,152 @@ function makeProgressBar(done: number, total: number, width: number, style: Retu
 	const bar = "[" + "█".repeat(filled) + "░".repeat(empty) + "]";
 	const color = done === total ? "success" : "accent";
 	return style.fg(color, bar);
+}
+
+// ---------------------------------------------------------------------------
+// Braille multi-progress
+// Each braille cell is a 2x4 dot matrix. A group of up to four auditor tracks
+// maps onto the four dot rows (one row per track), and the two dot columns give
+// half-cell horizontal resolution. Consecutive cells with the same dominant
+// track share one color escape, so a 3-auditor bar costs at most a few escapes.
+// ---------------------------------------------------------------------------
+
+interface AuditTrack {
+	id: string;
+	done: number;
+	total: number;
+	state: "queued" | "running" | "passed" | "failed" | "error";
+}
+
+const BRAILLE_LEVEL_BITS: Array<{ left: number; right: number }> = [
+	{ left: 0x01, right: 0x08 },
+	{ left: 0x02, right: 0x10 },
+	{ left: 0x04, right: 0x20 },
+	{ left: 0x40, right: 0x80 },
+];
+
+function auditTrackColor(track: AuditTrack): string {
+	switch (track.state) {
+		case "passed":
+			return "success";
+		case "failed":
+		case "error":
+			return "error";
+		case "running":
+			return "accent";
+		default:
+			return "dim";
+	}
+}
+
+function brailleCell(bits: number): string {
+	return bits === 0 ? " " : String.fromCharCode(0x2800 + bits);
+}
+
+function renderBrailleRow(
+	tracks: AuditTrack[],
+	width: number,
+	style: ReturnType<typeof makeStyleHelpers>,
+): string {
+	if (width <= 0 || tracks.length === 0) return "";
+	const cells = new Array<number>(width).fill(0);
+	const colors = new Array<string | null>(width).fill(null);
+	// When several tracks share a cell, the most urgent one wins the color.
+	const rank: Record<string, number> = { dim: 0, success: 1, accent: 2, error: 3 };
+
+	// A single track uses all four dot rows so it reads as a thick bar. Two to
+	// four tracks each get one row.
+	const levels = tracks.length === 1 ? [0, 1, 2, 3] : [0, 1, 2, 3].slice(0, tracks.length);
+	for (const level of levels) {
+		const track = tracks[tracks.length === 1 ? 0 : level];
+		if (track.state === "queued") continue;
+		const fraction = track.total > 0 ? Math.min(1, track.done / track.total) : 0;
+		const dots = Math.round(fraction * width * 2);
+		if (dots <= 0) continue;
+		const color = auditTrackColor(track);
+		for (let dot = 0; dot < dots; dot++) {
+			const cell = Math.floor(dot / 2);
+			if (cell >= width) break;
+			const bits = BRAILLE_LEVEL_BITS[level];
+			cells[cell] |= dot % 2 === 0 ? bits.left : bits.right;
+			const current = colors[cell];
+			if (current === null || rank[color] >= rank[current]) colors[cell] = color;
+		}
+	}
+
+	let out = "";
+	let index = 0;
+	while (index < width) {
+		const color = colors[index];
+		let end = index;
+		let text = "";
+		while (end < width && colors[end] === color) {
+			text += brailleCell(cells[end]);
+			end++;
+		}
+		out += color ? style.fg(color, text) : text;
+		index = end;
+	}
+	return out;
+}
+
+function renderAuditLegend(
+	tracks: AuditTrack[],
+	width: number,
+	style: ReturnType<typeof makeStyleHelpers>,
+): string {
+	if (tracks.length === 0) return style.fg("dim", "no tasks to verify");
+	const parts = tracks.map((track) => style.fg(auditTrackColor(track), `${track.id} ${track.done}/${track.total}`));
+	const done = tracks.reduce((sum, track) => sum + track.done, 0);
+	const total = tracks.reduce((sum, track) => sum + track.total, 0);
+	const overall = style.fg("muted", `  ${done}/${total}`);
+
+	let out = "";
+	let shown = 0;
+	for (const part of parts) {
+		const next = out.length > 0 ? `${out}${style.fg("dim", " · ")}${part}` : part;
+		// Reserve a few cells for a "+N" hidden-auditor marker.
+		if (visibleWidth(next + overall) + 4 > width) break;
+		out = next;
+		shown += 1;
+	}
+	if (out.length === 0) return truncateToWidth(parts[0] ?? "", width, "...", false);
+	const hidden = tracks.length - shown;
+	const hiddenLabel = hidden > 0 ? style.fg("dim", ` +${hidden}`) : "";
+	return out + hiddenLabel + overall;
+}
+
+function auditTracks(state: GoalState): AuditTrack[] {
+	const shards = state.audit?.shards;
+	if (shards && shards.length > 0) {
+		return shards.map((shard) => {
+			const total = shard.taskIds.length;
+			const done = Math.min(total, shard.verified ?? Object.keys(shard.results || {}).length);
+			let trackState: AuditTrack["state"];
+			if (shard.status === "queued") trackState = "queued";
+			else if (shard.status === "running") trackState = "running";
+			else if (shard.status === "error") trackState = "error";
+			else if (shard.approved === true) trackState = "passed";
+			else if (shard.approved === false) trackState = "failed";
+			else trackState = "running";
+			return { id: shard.id, done, total, state: trackState };
+		});
+	}
+	// Legacy single-auditor state (no shard records).
+	const total = state.tasks.length;
+	const done = state.tasks.filter((task) => task.auditResult).length;
+	return [{ id: "A1", done, total, state: "running" }];
+}
+
+function findActiveAuditTask(state: GoalState): { auditorId: string; task: TaskState } | null {
+	const shards = state.audit?.shards;
+	if (!shards) return null;
+	for (const shard of shards) {
+		if (shard.status !== "running") continue;
+		const task = state.tasks.find((t) => shard.taskIds.includes(t.id) && !(shard.results || {})[t.id]);
+		if (task) return { auditorId: shard.id, task };
+	}
+	return null;
 }
 
 function styleTaskLine(line: string, style: ReturnType<typeof makeStyleHelpers>, currentIndex: number): string {
@@ -802,9 +1083,10 @@ function queueGoalMessage(
 }
 
 // ---------------------------------------------------------------------------
-// Audit runner. Spawns the isolated auditor in-process and streams its
-// activity (thinking tokens, tool calls, results) into state.auditLog so the
-// widget panel updates live while the audit runs.
+// Audit runner. Splits the task list into per-task shards and runs one
+// isolated auditor per shard in parallel, each inside its own git worktree.
+// Thinking tokens, tool calls, per-task verdicts and the final shard verdict
+// all stream into state.auditLog / state.audit so the widget updates live.
 // ---------------------------------------------------------------------------
 
 const AUDITOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -840,78 +1122,80 @@ function findProjectAGENTS(cwd: string): Array<{ path: string; content: string }
 let auditInFlight: Promise<{ approved: boolean; feedback: string } | null> | null = null;
 let auditFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-// The verdict tool injected into the auditor session. It applies the verdict
-// by writing shared state, which the main session's widget watcher picks up.
-const auditVerdictTool = defineTool({
-	name: "goal_audit_result",
-	label: "Submit audit result",
-	description:
-		"AUDITOR-ONLY. Submit the verdict from an isolated auditor. If approved, the goal is completed. If rejected, the failed tasks are reset to pending so the host can re-execute. Only the auditor should call this tool.",
-	parameters: Type.Object({
-		approved: Type.Boolean({ description: "True if the auditor verified all tasks meet their acceptance criteria" }),
-		feedback: Type.String({ description: "The auditor's verdict and reasoning" }),
-		failedTasks: Type.Optional(
-			Type.Array(
-				Type.Object({
-					id: Type.String(),
-					reason: Type.String(),
-				}),
-				{ description: "Tasks that did not meet their acceptance criteria (only when approved=false)" },
-			),
-		),
-	}),
-	executionMode: "sequential",
+// Abort handles for the live auditor sessions. Stopping, pausing, failing or
+// deleting a goal during an audit should not leave N model sessions running.
+const activeAuditorAborts = new Set<() => void>();
 
-	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-		const result = applyAuditVerdict(params);
-		return {
-			content: [
-				{
-					type: "text",
-					text: result.approved
-						? "Verdict recorded. Goal completed."
-						: `Verdict recorded. ${result.failedTaskCount} task(s) reset to pending.`,
-				},
-			],
-			details: { approved: result.approved, failedTaskCount: result.failedTaskCount },
-		};
-	},
-});
+function abortActiveAuditors(): void {
+	for (const abort of activeAuditorAborts) {
+		try {
+			abort();
+		} catch {}
+	}
+	activeAuditorAborts.clear();
+}
+
+// Thinking deltas arrive token by token for every auditor. Buffer them per
+// auditor and persist each growing line on a short shared timer, so N
+// concurrent auditors do not clobber each other's live thought line.
+const thinkingBuffers = new Map<string, string>();
+const thinkingLineIndex = new Map<string, number>();
 
 function sanitizeLogLine(text: string): string {
 	return text.replace(/[\r\n]+/g, " ");
 }
 
-function appendAuditLog(lines: string[]): void {
+// The audit log is live activity only (the widget shows the tail, the final
+// report is built from state.tasks). Cap it so a long parallel audit cannot
+// grow state.json without bound. Indices used to update in-place thinking
+// lines are shifted by the number of dropped entries.
+const MAX_AUDIT_LOG_LINES = 500;
+
+function trimAuditLog(state: GoalState): void {
+	const log = state.auditLog || [];
+	const overflow = log.length - MAX_AUDIT_LOG_LINES;
+	if (overflow <= 0) return;
+	state.auditLog = log.slice(overflow);
+	for (const [id, index] of thinkingLineIndex) {
+		const shifted = index - overflow;
+		if (shifted >= 0) thinkingLineIndex.set(id, shifted);
+		else thinkingLineIndex.delete(id);
+	}
+}
+
+function appendAuditLog(lines: string[], auditorId?: string): void {
 	const state = loadState();
 	if (!state || state.status !== "auditing") return;
-	state.auditLog = [...(state.auditLog || []), ...lines.map(sanitizeLogLine)];
+	const prefix = auditorId ? `[${auditorId}] ` : "";
+	state.auditLog = [...(state.auditLog || []), ...lines.map((line) => prefix + sanitizeLogLine(line))];
+	trimAuditLog(state);
 	saveState(state);
 }
 
-// Batch high-frequency thinking deltas (they arrive token by token) and
-// persist the growing thought line on a short timer, so the widget updates
-// live without writing the state file on every token.
-let pendingThinkingText: string | null = null;
-
-function scheduleAuditThinkingFlush(text: string): void {
-	pendingThinkingText = text;
+function scheduleAuditThinkingFlush(auditorId: string, text: string): void {
+	thinkingBuffers.set(auditorId, text);
 	if (auditFlushTimer) return;
 	auditFlushTimer = setTimeout(() => {
 		auditFlushTimer = null;
-		const text = pendingThinkingText;
-		pendingThinkingText = null;
-		if (text === null) return;
-		const st = loadState();
-		if (!st || st.status !== "auditing") return;
-		const tail = st.auditLog[st.auditLog.length - 1];
-		const line = "thinking: " + sanitizeLogLine(text.trim());
-		if (tail && tail.startsWith("thinking: ")) {
-			st.auditLog[st.auditLog.length - 1] = line;
-		} else {
-			st.auditLog = [...(st.auditLog || []), line];
+		const state = loadState();
+		if (!state || state.status !== "auditing") {
+			thinkingBuffers.clear();
+			thinkingLineIndex.clear();
+			return;
 		}
-		saveState(st);
+		for (const [id, raw] of thinkingBuffers) {
+			const line = `[${id}] thinking: ${sanitizeLogLine(raw.trim())}`;
+			const index = thinkingLineIndex.get(id);
+			if (index !== undefined && state.auditLog[index]?.startsWith(`[${id}] thinking: `)) {
+				state.auditLog[index] = line;
+			} else {
+				state.auditLog.push(line);
+				thinkingLineIndex.set(id, state.auditLog.length - 1);
+			}
+		}
+		trimAuditLog(state);
+		thinkingBuffers.clear();
+		saveState(state);
 		if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
 	}, 100);
 }
@@ -924,8 +1208,45 @@ function auditLogError(message: string): void {
 	saveState(state);
 }
 
+function updateShardState(auditorId: string, patch: Partial<AuditShardState>): void {
+	const state = loadState();
+	if (!state?.audit) return;
+	const shard = state.audit.shards.find((s) => s.id === auditorId);
+	if (!shard) return;
+	Object.assign(shard, patch);
+	saveState(state);
+}
+
+function recordShardTask(auditorId: string, taskId: string, passed: boolean, reason: string | null): void {
+	const state = loadState();
+	if (!state?.audit) return;
+	const shard = state.audit.shards.find((s) => s.id === auditorId);
+	if (!shard) return;
+	shard.results = { ...(shard.results || {}), [taskId]: { passed, reason } };
+	shard.verified = Object.keys(shard.results).length;
+	saveState(state);
+}
+
+function recordShardVerdict(
+	auditorId: string,
+	verdict: { approved: boolean; feedback: string; failedTasks: { id: string; reason: string }[] },
+): void {
+	const state = loadState();
+	if (!state?.audit) return;
+	const shard = state.audit.shards.find((s) => s.id === auditorId);
+	if (!shard) return;
+	shard.status = "verdict";
+	shard.approved = verdict.approved;
+	shard.feedback = verdict.feedback;
+	shard.failedTasks = verdict.failedTasks;
+	// The shard is fully processed once a verdict lands, even if the auditor
+	// skipped a per-task record. Keep the progress track honest.
+	shard.verified = shard.taskIds.length;
+	saveState(state);
+}
+
 // Apply the auditor verdict to persisted state. Shared by the AUDITOR-ONLY
-// goal_audit_result tool (external caller) and the in-process audit session.
+// goal_audit_result tool (external caller) and the parallel audit coordinator.
 function applyAuditVerdict(params: { approved: boolean; feedback: string; failedTasks?: { id: string; reason: string }[] }): {
 	approved: boolean;
 	failedTaskCount: number;
@@ -1015,16 +1336,37 @@ function summarizeResult(result: unknown): string {
 	return "";
 }
 
-function buildAuditorSystemPrompt(state: GoalState, projectCwd: string): string {
-	const tasks = state.tasks
+interface AuditAssignment {
+	auditorId: string;
+	total: number;
+	tasks: TaskState[];
+	worktree: string | null;
+	statePath: string;
+}
+
+function buildAuditorSystemPrompt(state: GoalState, projectCwd: string, assignment: AuditAssignment): string {
+	const tasks = assignment.tasks
 		.map((t, i) => {
 			const criteria = t.acceptanceCriteria.map((c) => `      - ${c}`).join("\n");
 			return `  ${i + 1}. ${t.id}: ${t.description}\n     contract: ${t.contract}\n     acceptance criteria:\n${criteria}`;
 		})
 		.join("\n\n");
+
+	const worktreeNote = assignment.worktree
+		? `You are working in an isolated git worktree at ${assignment.worktree}. It contains the project's current working-tree state (HEAD plus the executor's uncommitted changes). Run builds and tests here. Do not read or write any other worktree.`
+		: "You are working in the project's main working tree. Other auditors may be running concurrently, so avoid destructive commands.";
+	const assignmentText = [
+		`You are ${assignment.auditorId} of ${assignment.total} auditors running in parallel.`,
+		`You verify ONLY the ${assignment.tasks.length} task(s) listed below. Other auditors verify the remaining tasks.`,
+		"Your approval alone does NOT complete the goal. The coordinator merges every auditor's verdict.",
+		worktreeNote,
+	].join("\n");
+
 	const prompt = AUDITOR_SYSTEM_PROMPT_TEMPLATE
+		.replaceAll("__STATEPATH__", assignment.statePath)
 		.replace("__GOAL__", state.refinedGoal || state.goal)
 		.replace("__RESULT__", state.result || "(none provided)")
+		.replace("__ASSIGNMENT__", assignmentText)
 		.replace("__TASKS__", tasks);
 
 	// Fold the project's local AGENTS.md files into the auditor system prompt
@@ -1037,34 +1379,321 @@ function buildAuditorSystemPrompt(state: GoalState, projectCwd: string): string 
 	return `${prompt}\n\n<system>\n${content}\n</system>`;
 }
 
-function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved: boolean; feedback: string } | null> {
-	if (auditInFlight) return auditInFlight;
+// ---------------------------------------------------------------------------
+// Git worktree isolation
+// ---------------------------------------------------------------------------
 
-	auditInFlight = (async () => {
-		const state = loadState();
-		if (!state || state.status !== "auditing") return null;
+function runGit(cwd: string, args: string[], input?: string): string {
+	return execFileSync("git", ["-C", cwd, ...args], {
+		encoding: "utf-8",
+		input,
+		stdio: input === undefined ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+		maxBuffer: 128 * 1024 * 1024,
+	});
+}
 
-		appendAuditLog(["spawning isolated auditor..."]);
+interface AuditWorktree {
+	dir: string;
+	cleanup: () => void;
+}
 
-		let modelRuntime;
+// Create a detached worktree at HEAD, then overlay the executor's uncommitted
+// work (tracked diff plus untracked, non-ignored files) so the auditor sees
+// exactly what was delivered rather than a stale commit. Heavy dependency
+// directories are symlinked from the main tree so tests can run without a
+// fresh install in every worktree. Returns null when the project is not a git
+// repository (or the worktree cannot be prepared), in which case the caller
+// falls back to the shared working tree.
+// Cheap preflight used by the coordinator: can this project host worktrees at
+// all? When it cannot, parallel auditors would share one working tree and
+// collide on builds, locks and test ports, so the coordinator drops to one
+// auditor at a time.
+function canIsolateWithWorktrees(projectCwd: string): boolean {
+	try {
+		const repoRoot = runGit(projectCwd, ["rev-parse", "--show-toplevel"]).trim();
+		if (!repoRoot) return false;
+		runGit(repoRoot, ["rev-parse", "--verify", "HEAD"]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function createAuditWorktree(projectCwd: string, shardId: string, cfg: AuditConfig): AuditWorktree | null {
+	if (!cfg.worktree) return null;
+
+	let repoRoot: string;
+	try {
+		repoRoot = runGit(projectCwd, ["rev-parse", "--show-toplevel"]).trim();
+		runGit(repoRoot, ["rev-parse", "--verify", "HEAD"]);
+	} catch {
+		return null;
+	}
+	if (!repoRoot) return null;
+
+	// Include the pid so two pi processes auditing the same repository do not
+	// fight over (and delete) each other's worktree paths.
+	const dir = path.join(repoRoot, ".pi", "goal", "audit", `${shardId}-${process.pid}`);
+	const cleanup = (): void => {
+		// Remove linked dependency directories first so a recursive delete can
+		// never wander into the main tree through a symlink.
+		for (const name of cfg.linkPaths) {
+			try {
+				const linked = path.join(dir, name);
+				if (fs.lstatSync(linked).isSymbolicLink()) fs.unlinkSync(linked);
+			} catch {}
+		}
 		try {
-			modelRuntime = await ModelRuntime.create();
-		} catch (err) {
-			auditLogError(`FAILED: could not initialize model runtime: ${(err as Error).message}`);
-			throw err;
+			runGit(repoRoot, ["worktree", "remove", "--force", dir]);
+		} catch {}
+		try {
+			runGit(repoRoot, ["worktree", "prune"]);
+		} catch {}
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {}
+	};
+
+	try {
+		try {
+			runGit(repoRoot, ["worktree", "prune"]);
+		} catch {}
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.mkdirSync(path.dirname(dir), { recursive: true });
+		runGit(repoRoot, ["worktree", "add", "--detach", "--force", dir, "HEAD"]);
+
+		// Tracked but uncommitted changes (staged and unstaged).
+		const patch = runGit(repoRoot, ["diff", "HEAD", "--binary", "--no-color", "--no-ext-diff"]);
+		if (patch.trim().length > 0) {
+			runGit(dir, ["apply", "--binary", "--whitespace=nowarn", "-"], patch);
 		}
 
-		// Fully isolated session: no project/user extensions (so the goal
-		// extension does not re-register its tools or widgets inside the
-		// auditor), no skills, no prompt templates, no context files. The
-		// auditor gets only the read/verify tools plus the verdict tool.
-		// The system prompt is passed directly to the resource loader so it
-		// survives the session.prompt() internal reset to _baseSystemPrompt.
-		const auditorPrompt = buildAuditorSystemPrompt(loadState() || state, ctx.cwd);
+		// Untracked, non-ignored files the executor created. Skip the pi state
+		// directory and anything unreasonably large.
+		const untracked = runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
+		for (const rel of untracked.split("\0")) {
+			if (!rel) continue;
+			if (rel === ".pi" || rel.startsWith(".pi/") || rel === ".git" || rel.startsWith(".git/")) continue;
+			const src = path.join(repoRoot, rel);
+			const dst = path.join(dir, rel);
+			try {
+				const stat = fs.statSync(src);
+				if (!stat.isFile() || stat.size > 16 * 1024 * 1024) continue;
+				fs.mkdirSync(path.dirname(dst), { recursive: true });
+				fs.copyFileSync(src, dst);
+			} catch {
+				// A file can disappear between listing and copying; ignore it.
+			}
+		}
+
+		// Link dependency directories (node_modules, .venv, ...) so test and
+		// build commands resolve without reinstalling in every worktree.
+		for (const name of cfg.linkPaths) {
+			const src = path.join(repoRoot, name);
+			const dst = path.join(dir, name);
+			try {
+				if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+				const isDir = fs.statSync(src).isDirectory();
+				fs.symlinkSync(src, dst, isDir ? (process.platform === "win32" ? "junction" : "dir") : "file");
+			} catch {}
+		}
+	} catch {
+		cleanup();
+		return null;
+	}
+
+	return { dir, cleanup };
+}
+
+// ---------------------------------------------------------------------------
+// Sharding and concurrency
+// ---------------------------------------------------------------------------
+
+// Round-robin distribution keeps shard sizes balanced regardless of task
+// count. Each task is verified by exactly one auditor.
+function shardTasks(tasks: TaskState[], auditorCount: number): TaskState[][] {
+	if (tasks.length === 0) return [];
+	const count = Math.max(1, Math.min(auditorCount, tasks.length));
+	const shards: TaskState[][] = Array.from({ length: count }, () => []);
+	tasks.forEach((task, index) => shards[index % count].push(task));
+	return shards;
+}
+
+async function runWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+		while (true) {
+			const index = next++;
+			if (index >= items.length) return;
+			results[index] = await worker(items[index], index);
+		}
+	});
+	await Promise.all(runners);
+	return results;
+}
+
+// ---------------------------------------------------------------------------
+// Per-auditor tools
+// ---------------------------------------------------------------------------
+
+interface ShardSink {
+	results: Map<string, { passed: boolean; reason: string | null }>;
+	verdict: { approved: boolean; feedback: string; failedTasks: { id: string; reason: string }[] } | null;
+}
+
+// Record the verdict for a single task. Called by the auditor after verifying
+// each assigned task, which is what drives the per-shard progress track.
+function makeAuditTaskTool(auditorId: string, allowedTaskIds: Set<string>, sink: ShardSink) {
+	return defineTool({
+		name: "goal_audit_task",
+		label: `Record task verdict (${auditorId})`,
+		description: `AUDITOR-ONLY (${auditorId}). Record the verdict for ONE assigned task after verifying its acceptance criteria. Call this once per assigned task, before submitting the shard verdict.`,
+		parameters: Type.Object({
+			taskId: Type.String({ description: "The id of the assigned task" }),
+			passed: Type.Boolean({ description: "True if every acceptance criterion of this task is met" }),
+			reason: Type.Optional(Type.String({ description: "Why the task passed or failed" })),
+		}),
+		executionMode: "sequential",
+
+		async execute(_toolCallId, params) {
+			if (!allowedTaskIds.has(params.taskId)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Task ${params.taskId} is not assigned to ${auditorId}. Assigned tasks: ${[...allowedTaskIds].join(", ")}`,
+						},
+					],
+					details: { error: "not_assigned" as string | null, taskId: params.taskId, passed: false },
+				};
+			}
+			const reason = params.reason ?? null;
+			sink.results.set(params.taskId, { passed: params.passed, reason });
+			recordShardTask(auditorId, params.taskId, params.passed, reason);
+			appendAuditLog(
+				[`${params.passed ? "PASS" : "FAIL"} ${params.taskId}${reason ? `: ${reason}` : ""}`],
+				auditorId,
+			);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Recorded ${params.passed ? "PASS" : "FAIL"} for ${params.taskId}. Continue with the next assigned task.`,
+					},
+				],
+				details: { error: null as string | null, taskId: params.taskId, passed: params.passed },
+			};
+		},
+	});
+}
+
+// Submit the shard-level verdict. It does not finalize the goal; the
+// coordinator merges every shard's verdict afterwards.
+function makeAuditVerdictTool(auditorId: string, allowedTaskIds: Set<string>, sink: ShardSink) {
+	return defineTool({
+		name: "goal_audit_result",
+		label: `Submit audit result (${auditorId})`,
+		description: `AUDITOR-ONLY (${auditorId}). Submit the verdict for the tasks assigned to ${auditorId}. The coordinator merges all auditor verdicts. Do not assume your approval completes the goal.`,
+		parameters: Type.Object({
+			approved: Type.Boolean({
+				description: "True if every acceptance criterion of every task assigned to you is met",
+			}),
+			feedback: Type.String({ description: "The auditor's verdict and reasoning" }),
+			failedTasks: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.String(),
+						reason: Type.String(),
+					}),
+					{ description: "Assigned tasks that did not meet their acceptance criteria (only when approved=false)" },
+				),
+			),
+		}),
+		executionMode: "sequential",
+
+		async execute(_toolCallId, params) {
+			const failedTasks = (params.failedTasks || []).filter((t) => allowedTaskIds.has(t.id));
+			// Fold in per-task failures the auditor already recorded, even if
+			// it forgot to repeat them in failedTasks.
+			for (const [id, result] of sink.results) {
+				if (!result.passed && !failedTasks.some((t) => t.id === id)) {
+					failedTasks.push({ id, reason: result.reason || params.feedback });
+				}
+			}
+			// A shard-level rejection without any named failure fails the
+			// whole shard; this keeps the coordinator conservative.
+			if (!params.approved && failedTasks.length === 0) {
+				for (const id of allowedTaskIds) failedTasks.push({ id, reason: params.feedback });
+			}
+			const approved = params.approved && failedTasks.length === 0;
+			sink.verdict = { approved, feedback: params.feedback, failedTasks };
+			recordShardVerdict(auditorId, { approved, feedback: params.feedback, failedTasks });
+			appendAuditLog([`verdict: ${approved ? "PASS" : "FAIL"}`], auditorId);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Verdict recorded for ${auditorId}. The coordinator merges all auditor verdicts; do not assume the goal is complete.`,
+					},
+				],
+				details: { approved, failedTaskCount: failedTasks.length },
+			};
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------
+// One auditor session
+// ---------------------------------------------------------------------------
+
+async function runOneAuditor(args: {
+	auditorId: string;
+	totalAuditors: number;
+	shardTasks: TaskState[];
+	sink: ShardSink;
+	modelRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>;
+	ctx: ExtensionContext;
+	cfg: AuditConfig;
+}): Promise<void> {
+	const { auditorId, totalAuditors, shardTasks: tasks, sink, modelRuntime, ctx, cfg } = args;
+	const allowedTaskIds = new Set(tasks.map((t) => t.id));
+	const worktree = createAuditWorktree(ctx.cwd, auditorId, cfg);
+	const sessionCwd = worktree?.dir ?? ctx.cwd;
+
+	updateShardState(auditorId, { status: "running", worktree: worktree?.dir ?? null });
+	appendAuditLog(
+		[
+			`started: ${tasks.length} task(s)${worktree ? ` in ${path.relative(ctx.cwd, worktree.dir)}` : " in the shared working tree"}`,
+		],
+		auditorId,
+	);
+	if (cfg.worktree && !worktree) {
+		appendAuditLog(["worktree unavailable; using the shared working tree"], auditorId);
+	}
+
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	let abortSession: (() => void) | undefined;
+	let unsubscribe: () => void = () => {};
+	let timedOut = false;
+
+	try {
+		const prompt = buildAuditorSystemPrompt(loadState() || ({} as GoalState), ctx.cwd, {
+			auditorId,
+			total: totalAuditors,
+			tasks,
+			worktree: worktree?.dir ?? null,
+			statePath: getStatePath(),
+		});
+
 		const loader = new DefaultResourceLoader({
-			cwd: ctx.cwd,
+			cwd: sessionCwd,
 			agentDir: getAgentDir(),
-			systemPrompt: auditorPrompt,
+			systemPrompt: prompt,
 			noExtensions: true,
 			noSkills: true,
 			noPromptTemplates: true,
@@ -1073,29 +1702,29 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 		});
 		await loader.reload();
 
-		const { session } = await createAgentSession({
+		const created = await createAgentSession({
 			modelRuntime,
-			cwd: ctx.cwd,
+			cwd: sessionCwd,
 			resourceLoader: loader,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(sessionCwd),
 			model: ctx.model,
-			// Use a low thinking level so the auditor does not burn its
-			// context window on reasoning before calling the verdict tool.
-			thinkingLevel: "low",
-			tools: [...AUDITOR_TOOLS, "goal_audit_result"],
-			customTools: [auditVerdictTool],
+			thinkingLevel: cfg.thinkingLevel,
+			tools: [...AUDITOR_TOOLS, "goal_audit_task", "goal_audit_result"],
+			customTools: [makeAuditTaskTool(auditorId, allowedTaskIds, sink), makeAuditVerdictTool(auditorId, allowedTaskIds, sink)],
 		});
+		session = created.session;
+		abortSession = (): void => {
+			void session?.abort();
+		};
+		activeAuditorAborts.add(abortSession);
 
-		// Stream the auditor's activity into the audit log.
 		let thinkingBuf = "";
-		const unsubscribe = session.subscribe((event) => {
+		unsubscribe = session.subscribe((event) => {
 			if (event.type === "message_update") {
 				const ev = event.assistantMessageEvent;
 				if (ev.type === "thinking_delta") {
 					thinkingBuf += ev.delta;
-					// Persist the growing thought line on a debounce; the panel
-					// shows a live, growing thought instead of a new line per token.
-					scheduleAuditThinkingFlush(thinkingBuf);
+					scheduleAuditThinkingFlush(auditorId, thinkingBuf);
 					return;
 				}
 				if (ev.type === "thinking_end") {
@@ -1106,67 +1735,209 @@ function runAudit(ctx: ExtensionContext, api: ExtensionAPI): Promise<{ approved:
 
 			if (event.type === "tool_execution_start") {
 				const arg = summarizeArgs(event.toolName, event.args);
-				appendAuditLog([`tool: ${event.toolName}${arg ? ` ${arg}` : ""}`]);
+				appendAuditLog([`tool: ${event.toolName}${arg ? ` ${arg}` : ""}`], auditorId);
 				return;
 			}
 
 			if (event.type === "tool_execution_end") {
 				const summary = summarizeResult(event.result);
 				const marker = event.isError ? "FAIL" : "ok";
-				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` -> ${summary}` : ""}`]);
-				if (event.toolName === "goal_audit_result") {
-					// The verdict tool already applied the result via its own
-					// execute, so generation is done; abort the auditor session
-					// to stop token generation before any follow-up turn. A
-					// failed verdict call is left alone so the audit can continue.
-					if (!event.isError) {
-						void session.abort();
-					}
-					return;
+				appendAuditLog([`  ${marker} ${event.toolName}${summary ? ` -> ${summary}` : ""}`], auditorId);
+				if (event.toolName === "goal_audit_result" && !event.isError) {
+					// The verdict tool already recorded the shard result, so
+					// generation is done; stop token generation before any
+					// follow-up turn. A failed verdict call is left alone.
+					void session?.abort();
 				}
 				return;
 			}
 
 			if (event.type === "agent_end") {
-				appendAuditLog(["auditor finished"]);
+				appendAuditLog(["turn ended"], auditorId);
 			}
 		});
 
+		const timer = setTimeout(() => {
+			timedOut = true;
+			appendAuditLog([`timed out after ${Math.round(cfg.timeoutMs / 1000)}s`], auditorId);
+			void session?.abort();
+		}, cfg.timeoutMs);
+
 		try {
 			await session.prompt(
-				"Read .pi/goal/state.json, verify every task against its acceptance criteria, then submit your verdict via goal_audit_result.",
+				`You are ${auditorId}. Read your assignment, verify every assigned task, record each one with goal_audit_task, then submit your shard verdict with goal_audit_result.`,
 			);
 
-			// The auditor can finish its turn without submitting a verdict
-			// (e.g. it ran out of context or just stopped). Follow up in the
-			// same conversation and insist it submit the verdict via the tool
-			// before giving up.
-			let st = loadState();
 			let followUps = 0;
-			while (st && st.status === "auditing" && followUps < 3) {
+			while (!sink.verdict && !timedOut && followUps < 2) {
 				followUps += 1;
-				appendAuditLog([`auditor finished without a verdict; following up (${followUps}/3)...`]);
+				appendAuditLog([`no verdict yet; following up (${followUps}/2)`], auditorId);
 				await session.prompt(
-					"You finished without submitting a verdict. You must call goal_audit_result exactly once to submit your verdict: approved (boolean), feedback (string), and on rejection the failedTasks (id and reason). If you cannot verify the goal, reject it and say why. Do not end your turn before calling the tool.",
+					"You have not submitted your shard verdict. Record any remaining assigned task with goal_audit_task, then call goal_audit_result exactly once with approved (boolean), feedback (string), and on rejection the failedTasks (id and reason). Do not end your turn before calling it.",
 				);
-				st = loadState();
 			}
-
-			if (st && st.status === "active") {
-				// Rejected: hand the failing tasks back to the main agent.
-				// goal_complete.execute() returns the verdict to the agent directly
-				// via the tool result; no follow-up message needed.
-				return { approved: false, feedback: st.auditFeedback || "No feedback provided" };
-			} else if (st && st.status === "completed") {
-				return { approved: true, feedback: st.auditFeedback || "All criteria met" };
-			}
-			return null;
 		} finally {
-			unsubscribe();
-			session.dispose();
+			clearTimeout(timer);
 		}
+
+		if (!sink.verdict) {
+			updateShardState(auditorId, { status: "error" });
+			appendAuditLog(["finished without a verdict"], auditorId);
+		}
+	} catch (err) {
+		// A verdict recorded before the abort still counts; only a shard that
+		// never produced one is marked as errored.
+		if (!sink.verdict) {
+			updateShardState(auditorId, { status: "error" });
+			appendAuditLog([`FAILED: ${(err as Error).message}`], auditorId);
+		}
+	} finally {
+		if (abortSession) activeAuditorAborts.delete(abortSession);
+		try {
+			unsubscribe();
+		} catch {}
+		try {
+			session?.dispose();
+		} catch {}
+		worktree?.cleanup();
+		updateShardState(auditorId, { worktree: null });
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parallel audit coordinator
+// ---------------------------------------------------------------------------
+
+function runAudit(ctx: ExtensionContext, _api: ExtensionAPI): Promise<{ approved: boolean; feedback: string } | null> {
+	if (auditInFlight) return auditInFlight;
+
+	auditInFlight = (async () => {
+		const state = loadState();
+		if (!state || state.status !== "auditing") return null;
+
+		const cfg = loadAuditConfig();
+		const shards = shardTasks(state.tasks, cfg.auditors);
+		const sinks: ShardSink[] = shards.map(() => ({ results: new Map(), verdict: null }));
+
+		const worktreeFallback = cfg.worktree && !canIsolateWithWorktrees(ctx.cwd);
+		if (worktreeFallback) cfg.maxConcurrency = 1;
+
+		state.audit = {
+			startedAt: Date.now(),
+			finishedAt: null,
+			strategy: "per-task",
+			auditors: shards.length,
+			shards: shards.map((tasks, index) => ({
+				id: `A${index + 1}`,
+				taskIds: tasks.map((t) => t.id),
+				status: "queued",
+				worktree: null,
+				verified: 0,
+				approved: null,
+				feedback: null,
+				failedTasks: [],
+				results: {},
+			})),
+		};
+		state.auditLog = [
+			`Dispatching ${shards.length} auditor(s) across ${state.tasks.length} task(s) with concurrency ${Math.min(cfg.maxConcurrency, Math.max(1, shards.length))}.`,
+			...(worktreeFallback
+				? ["git worktree isolation unavailable; running auditors one at a time in the shared working tree."]
+				: []),
+		];
+		saveState(state);
+		refreshWidget(ctx);
+
+		let modelRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>;
+		try {
+			modelRuntime = await ModelRuntime.create();
+		} catch (err) {
+			auditLogError(`FAILED: could not initialize model runtime: ${(err as Error).message}`);
+			throw err;
+		}
+
+		try {
+			await runWithConcurrency(shards, cfg.maxConcurrency, async (tasks, index) => {
+				await runOneAuditor({
+					auditorId: `A${index + 1}`,
+					totalAuditors: shards.length,
+					shardTasks: tasks,
+					sink: sinks[index],
+					modelRuntime,
+					ctx,
+					cfg,
+				});
+			});
+		} finally {
+			thinkingBuffers.clear();
+			thinkingLineIndex.clear();
+		}
+
+		// The goal may have been stopped, paused, failed or deleted while the
+		// auditors were running. In that case their verdicts must not resurrect
+		// or complete it.
+		const afterRun = loadState();
+		if (!afterRun || afterRun.status !== "auditing") {
+			return null;
+		}
+
+		// Merge shard verdicts. A task fails if its auditor rejected it or if
+		// the auditor never produced a verdict (timeout, crash, abort).
+		const failedTasks: { id: string; reason: string }[] = [];
+		const feedbackParts: string[] = [];
+		for (let index = 0; index < shards.length; index++) {
+			const auditorId = `A${index + 1}`;
+			const verdict = sinks[index].verdict;
+			if (!verdict) {
+				for (const task of shards[index]) {
+					failedTasks.push({ id: task.id, reason: `${auditorId} produced no verdict (timeout or error).` });
+				}
+				feedbackParts.push(`${auditorId} [${shards[index].map((t) => t.id).join(", ")}]: NO VERDICT`);
+				updateShardState(auditorId, { status: "error" });
+				continue;
+			}
+			failedTasks.push(...verdict.failedTasks);
+			feedbackParts.push(
+				`${auditorId} [${shards[index].map((t) => t.id).join(", ")}]: ${verdict.approved ? "PASS" : "FAIL"} - ${verdict.feedback}`,
+			);
+		}
+
+		const approved = failedTasks.length === 0;
+		const feedback = approved
+			? `All ${state.tasks.length} task(s) verified by ${shards.length} auditor(s) in parallel.\n\n${feedbackParts.join("\n\n")}`
+			: feedbackParts.join("\n\n");
+
+		applyAuditVerdict({ approved, feedback, failedTasks });
+
+		const finalState = loadState();
+		if (finalState) {
+			// Carry the per-task reasons into the report so every task shows the
+			// evidence its own auditor produced, not just the merged blob.
+			const perTask = new Map<string, string>();
+			for (const sink of sinks) {
+				for (const [id, result] of sink.results) {
+					if (result.reason) perTask.set(id, result.reason);
+					else if (result.passed) perTask.set(id, "Verified against acceptance criteria");
+					// A failure without a reason keeps the verdict's failure reason.
+				}
+			}
+			if (perTask.size > 0) {
+				finalState.tasks = finalState.tasks.map((task) =>
+					perTask.has(task.id) ? { ...task, auditResult: perTask.get(task.id)! } : task,
+				);
+			}
+			if (finalState.audit) {
+				finalState.audit.finishedAt = Date.now();
+			}
+			saveState(finalState);
+		}
+		if (activeWidgetCtx) refreshWidget(activeWidgetCtx);
+
+		return { approved, feedback };
 	})().finally(() => {
 		auditInFlight = null;
+		thinkingBuffers.clear();
+		thinkingLineIndex.clear();
 	});
 
 	return auditInFlight!;
@@ -1540,7 +2311,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Complete goal",
 		description:
 			"Submit the goal for audit. Requires every task to be marked completed first. " +
-			"This spawns an isolated auditor that blocks until the verdict is delivered. Do not attempt to spawn the auditor yourself.",
+			"This dispatches parallel isolated auditors (one per task shard) and blocks until the coordinator merges their verdicts. Do not attempt to spawn the auditors yourself.",
 		parameters: Type.Object({
 			summary: Type.String({ description: "Summary of what was accomplished" }),
 		}),
@@ -1552,6 +2323,13 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "No goal to complete." }],
 					details: { error: "no_state" },
+				};
+			}
+
+			if (state.status === "auditing") {
+				return {
+					content: [{ type: "text", text: "An audit is already in progress. Wait for the coordinator to deliver its verdict." }],
+					details: { error: "audit_in_progress" },
 				};
 			}
 
@@ -1573,14 +2351,16 @@ export default function (pi: ExtensionAPI) {
 			state.status = "auditing";
 			state.result = params.summary;
 			state.auditFeedback = "auditor pending...";
+			state.audit = null;
 			state.auditLog = [
-				"Goal submitted for audit. Verifying each task against its acceptance criteria...",
+				"Goal submitted for audit. Dispatching parallel auditors per task...",
 			];
 			saveState(state);
 			refreshWidget(ctx as ExtensionContext);
 
-			// Spawn the isolated auditor in-process and stream its activity
-			// into the widget panel. The tool blocks until the audit finishes.
+			// Dispatch one isolated auditor per task shard in parallel and stream
+			// their activity into the widget panel. The tool blocks until the
+			// coordinator merges every shard verdict.
 			const result = await runAudit(ctx as ExtensionContext, pi);
 
 			if (result === null) {
@@ -1668,6 +2448,18 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			if (state.status === "auditing" && state.audit?.shards?.length) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "A parallel audit is already running. Only the in-process auditors may submit shard verdicts; the coordinator merges them.",
+						},
+					],
+					details: { error: "audit_in_progress" },
+				};
+			}
+
 			const result = applyAuditVerdict(params);
 
 			if (result.approved) {
@@ -1737,6 +2529,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const state = loadState();
+			abortActiveAuditors();
 			if (state) {
 				state.status = "failed";
 				state.result = params.reason;
@@ -1825,6 +2618,14 @@ export default function (pi: ExtensionAPI) {
 				}),
 			];
 
+			if (state.audit?.shards?.length) {
+				lines.push("", `Auditors: ${state.audit.shards.length} (per-task, worktree-isolated)`);
+				for (const shard of state.audit.shards) {
+					const verdict = shard.approved === true ? "PASS" : shard.approved === false ? "FAIL" : shard.status;
+					lines.push(`  ${shard.id} ${verdict} ${shard.verified}/${shard.taskIds.length} [${shard.taskIds.join(", ")}]`);
+				}
+			}
+
 			if (state.auditFeedback) lines.push("", `Audit: ${state.auditFeedback}`);
 			if (state.result) lines.push("", `Result: ${state.result}`);
 
@@ -1844,6 +2645,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Goal is in state "${state.status}", cannot pause.`, "warning");
 				return;
 			}
+			abortActiveAuditors();
 			state.status = "paused";
 			saveState(state);
 			ctx.ui.setStatus("pi-goal", "Paused");
@@ -1938,6 +2740,51 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 		},
 	});
 
+	pi.registerCommand("goal-auditors", {
+		description:
+			"Show or set the parallel auditor configuration. Usage: /goal-auditors [n|auto]. n is 1-16; auto uses one auditor per task (up to 16). Persisted in .pi/goal/config.json and overridable with PI_GOAL_AUDITORS, PI_GOAL_AUDIT_CONCURRENCY, PI_GOAL_AUDIT_WORKTREE, PI_GOAL_AUDIT_TIMEOUT_MS.",
+		handler: async (args, ctx) => {
+			const cfg = loadAuditConfig();
+			const arg = args.trim().toLowerCase();
+			if (!arg) {
+				ctx.ui.notify(
+					[
+						`Auditors: ${cfg.auditors}`,
+						`Max concurrency: ${cfg.maxConcurrency}`,
+						`Worktree isolation: ${cfg.worktree ? "on" : "off"}`,
+						`Per-auditor timeout: ${Math.round(cfg.timeoutMs / 1000)}s`,
+						`Linked paths: ${cfg.linkPaths.join(", ") || "(none)"}`,
+						`Thinking level: ${cfg.thinkingLevel}`,
+						"",
+						"Change with /goal-auditors <n|auto>, or edit .pi/goal/config.json (audit.*).",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+
+			if (arg === "auto") {
+				const next = saveAuditConfig({ auditors: 16, maxConcurrency: 8 });
+				ctx.ui.notify(
+					`Auditors set to auto: one per task (up to ${next.auditors}), concurrency ${next.maxConcurrency}. Applies to the next goal_complete.`,
+					"info",
+				);
+				return;
+			}
+
+			const n = Number.parseInt(arg, 10);
+			if (!Number.isFinite(n) || n < 1 || n > 16) {
+				ctx.ui.notify("Usage: /goal-auditors <1-16|auto>", "error");
+				return;
+			}
+			const next = saveAuditConfig({ auditors: n, maxConcurrency: Math.min(n, 8) });
+			ctx.ui.notify(
+				`Auditors set to ${next.auditors} (concurrency ${next.maxConcurrency}). Applies to the next goal_complete.`,
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("goal-stop", {
 		description: "Stop the current goal. The goal is marked as stopped and the widget is removed.",
 		handler: async (_args, ctx) => {
@@ -1946,6 +2793,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 				ctx.ui.notify("No active goal to stop.", "info");
 				return;
 			}
+			abortActiveAuditors();
 			state.status = "stopped";
 			state.result = "Stopped by user";
 			saveState(state);
@@ -1964,6 +2812,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 				ctx.ui.notify("No goal to delete.", "info");
 				return;
 			}
+			abortActiveAuditors();
 			clearState();
 			stopWatcher();
 			clearWidget(ctx);
@@ -1980,6 +2829,7 @@ Continue where you left off. Mark each task done with goal_update_task when fini
 				ctx.ui.notify("No goal to clear.", "info");
 				return;
 			}
+			abortActiveAuditors();
 			clearState();
 			stopWatcher();
 			clearWidget(ctx);
